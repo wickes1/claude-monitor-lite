@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+const (
+	daemonStartupDelay = 100 * time.Millisecond
+)
+
 // daemonize starts the process in background if not already daemonized
 func daemonize() {
 	// Check if we're already the background process
@@ -44,7 +48,7 @@ func daemonize() {
 	fmt.Println("Quit via the menu bar to stop.")
 
 	// Wait a moment for the child to create its PID file
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(daemonStartupDelay)
 
 	// Exit the parent process
 	os.Exit(0)

@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	refreshInterval = 30 * time.Second
-	pidCheckTimeout = 500 * time.Millisecond
+	refreshInterval    = 30 * time.Second
+	pidCheckTimeout    = 500 * time.Millisecond
+	pidFilePermissions = 0644 // Owner read/write, others read
 )
 
 var (
@@ -79,13 +80,18 @@ func calculateTimeUntilReset(resetTime time.Time) (hours, minutes int, valid boo
 		return 0, 0, false
 	}
 
-	duration := time.Until(resetTime)
+	// Truncate current time to the minute (ignore seconds)
+	now := time.Now()
+	nowTruncated := time.Date(now.Year(), now.Month(), now.Day(),
+		now.Hour(), now.Minute(), 0, 0, now.Location())
+
+	duration := resetTime.Sub(nowTruncated)
 	if duration < 0 {
 		return 0, 0, false
 	}
 
-	// Convert to total minutes and round to nearest 10 minutes
-	totalMinutes := roundToTenMinutes(int(duration.Minutes()))
+	// Convert to total minutes (no rounding - show exact time remaining)
+	totalMinutes := int(duration.Minutes())
 
 	return totalMinutes / 60, totalMinutes % 60, true
 }
@@ -470,7 +476,7 @@ func isRunning() bool {
 }
 
 func createPIDFile() error {
-	return os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+	return os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), pidFilePermissions)
 }
 
 func cleanup() {

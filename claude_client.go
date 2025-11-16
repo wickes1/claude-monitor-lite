@@ -111,11 +111,11 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return nil, fmt.Errorf("%w (status %d)", ErrAuthFailed, resp.StatusCode)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
 	}
@@ -169,7 +169,7 @@ func (c *ClaudeUsageClient) fetchOrganizationID() error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to fetch organizations (status %d)", resp.StatusCode)
 	}
 

@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+const (
+	configFilePermissions = 0600 // Owner read/write only
+)
+
 type Config struct {
 	SessionKey       string     `json:"sessionKey,omitempty"`
 	OrganizationID   string     `json:"organizationId,omitempty"`
@@ -44,7 +48,7 @@ func SaveConfig(config Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(GetConfigPath(), data, 0600)
+	return os.WriteFile(GetConfigPath(), data, configFilePermissions)
 }
 
 // SaveConfigPreservingSession updates only menuBarIndicator, preserving session fields
@@ -70,5 +74,5 @@ func SaveConfigPreservingSession(menuBarIndicator string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return os.WriteFile(path, data, configFilePermissions)
 }
