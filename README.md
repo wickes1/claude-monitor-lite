@@ -16,10 +16,29 @@ A lightweight macOS menu bar monitor for Claude usage, showing **real-time rate 
 ## Prerequisites
 
 - **macOS only** (requires macOS system tray APIs)
-- Go 1.25 or later
 - Claude account (Free, Pro, or Max)
 
 ## Installation
+
+### Via Homebrew (Recommended)
+
+```bash
+# Add the tap
+brew tap wickes1/tap
+
+# Install
+brew install --cask claude-monitor-lite
+
+# Upgrade to latest version
+brew upgrade --cask claude-monitor-lite
+
+# Uninstall
+brew uninstall --cask claude-monitor-lite
+```
+
+### From Source
+
+Requires Go 1.25 or later:
 
 ```bash
 git clone https://github.com/wickes1/claude-monitor-lite.git
