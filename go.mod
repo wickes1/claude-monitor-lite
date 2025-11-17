@@ -1,4 +1,4 @@
-module claude-monitor-lite
+module github.com/wickes1/claude-monitor-lite
 
 go 1.25
 
