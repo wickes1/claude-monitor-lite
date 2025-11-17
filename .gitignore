@@ -87,3 +87,4 @@ claude-monitor-lite-*
 .claude-monitor-lite.pid
 checksums.txt
 dist/
+.serena/

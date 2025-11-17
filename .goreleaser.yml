@@ -50,7 +50,7 @@ homebrew_casks:
       name: homebrew-tap
     directory: Casks
     homepage: https://github.com/wickes1/claude-monitor-lite
-    description: "Lightweight macOS menu bar monitor for Claude usage"
+    description: "Lightweight menu bar monitor for Claude usage"
     license: MIT
     hooks:
       post:

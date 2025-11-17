@@ -230,7 +230,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Claude Monitor Lite - macOS menu bar monitor for Claude usage")
+	fmt.Println("Claude Monitor Lite - Menu bar monitor for Claude usage")
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  claude-monitor-lite           Auto-start (login if needed, show status if running)")
