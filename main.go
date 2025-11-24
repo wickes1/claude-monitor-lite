@@ -26,7 +26,7 @@ var (
 	// Menu items (also serve as indicator selectors)
 	mCurrentSession *systray.MenuItem
 	mWeeklyAll      *systray.MenuItem
-	mWeeklyOpus     *systray.MenuItem
+	mWeeklySonnet   *systray.MenuItem
 
 	// Refresh button
 	mRefresh *systray.MenuItem
@@ -163,8 +163,8 @@ func getSelectedLimit(limits *UsageLimits, indicator string) *UsageLimit {
 		return limits.FiveHour
 	case "weeklyAll":
 		return limits.SevenDay
-	case "weeklyOpus":
-		return limits.SevenDayOpus
+	case "weeklySonnet":
+		return limits.SevenDaySonnet
 	default:
 		return limits.FiveHour
 	}
@@ -175,7 +175,7 @@ func displayUsageStats(limits *UsageLimits) {
 	fmt.Println("=== Current Usage ===")
 	fmt.Print(formatConsoleUsage(limits.FiveHour, "5-Hour Session:", "no active session"))
 	fmt.Print(formatConsoleUsage(limits.SevenDay, "Weekly (All):", ""))
-	fmt.Print(formatConsoleUsage(limits.SevenDayOpus, "Weekly (Opus):", ""))
+	fmt.Print(formatConsoleUsage(limits.SevenDaySonnet, "Weekly (Sonnet):", ""))
 	fmt.Println()
 }
 
@@ -337,7 +337,7 @@ func handleStatusDisplay() {
 	indicatorNames := map[string]string{
 		"currentSession": "5-Hour Session",
 		"weeklyAll":      "Weekly (All)",
-		"weeklyOpus":     "Weekly (Opus)",
+		"weeklySonnet":   "Weekly (Sonnet)",
 	}
 
 	indicatorName := indicatorNames[appConfig.MenuBarIndicator]
@@ -516,7 +516,7 @@ func onReady() {
 
 	mCurrentSession = systray.AddMenuItem("5-Hour Session: --", "Click to show in menu bar")
 	mWeeklyAll = systray.AddMenuItem("Weekly (All): --", "Click to show in menu bar")
-	mWeeklyOpus = systray.AddMenuItem("Weekly (Opus): --", "Click to show in menu bar")
+	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
 	systray.AddSeparator()
 
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
@@ -563,8 +563,8 @@ func onReady() {
 					updateMenuBarDisplay(cached)
 				}
 				go SaveConfigPreservingSession("weeklyAll")
-			case <-mWeeklyOpus.ClickedCh:
-				appConfig.MenuBarIndicator = "weeklyOpus"
+			case <-mWeeklySonnet.ClickedCh:
+				appConfig.MenuBarIndicator = "weeklySonnet"
 				updateMenuCheckmarks()
 				limitsMutex.RLock()
 				cached := lastLimits
@@ -572,7 +572,7 @@ func onReady() {
 				if cached != nil {
 					updateMenuBarDisplay(cached)
 				}
-				go SaveConfigPreservingSession("weeklyOpus")
+				go SaveConfigPreservingSession("weeklySonnet")
 			}
 		}
 	}()
@@ -581,15 +581,15 @@ func onReady() {
 func updateMenuCheckmarks() {
 	mCurrentSession.Uncheck()
 	mWeeklyAll.Uncheck()
-	mWeeklyOpus.Uncheck()
+	mWeeklySonnet.Uncheck()
 
 	switch appConfig.MenuBarIndicator {
 	case "currentSession":
 		mCurrentSession.Check()
 	case "weeklyAll":
 		mWeeklyAll.Check()
-	case "weeklyOpus":
-		mWeeklyOpus.Check()
+	case "weeklySonnet":
+		mWeeklySonnet.Check()
 	default:
 		mCurrentSession.Check()
 	}
@@ -616,7 +616,7 @@ func updateStats() {
 	// Update menu items using helper functions
 	mCurrentSession.SetTitle(formatUsageWithReset(limits.FiveHour, "5-Hour Session:"))
 	mWeeklyAll.SetTitle(formatUsageWithReset(limits.SevenDay, "Weekly (All):"))
-	mWeeklyOpus.SetTitle(formatUsageWithReset(limits.SevenDayOpus, "Weekly (Opus):"))
+	mWeeklySonnet.SetTitle(formatUsageWithReset(limits.SevenDaySonnet, "Weekly (Sonnet):"))
 
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()

@@ -41,8 +41,9 @@ type UsageLimits struct {
 	FiveHour          *UsageLimit `json:"five_hour,omitempty"`
 	SevenDay          *UsageLimit `json:"seven_day,omitempty"`
 	SevenDayOAuthApps *UsageLimit `json:"seven_day_oauth_apps,omitempty"`
-	SevenDayOpus      *UsageLimit `json:"seven_day_opus,omitempty"`
+	SevenDaySonnet    *UsageLimit `json:"seven_day_sonnet,omitempty"`
 	IguanaNecktie     *UsageLimit `json:"iguana_necktie,omitempty"`
+	ExtraUsage        *UsageLimit `json:"extra_usage,omitempty"`
 	LastUpdated       time.Time   `json:"-"`
 }
 
@@ -140,7 +141,7 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	}
 	parseResetTime(limits.FiveHour)
 	parseResetTime(limits.SevenDay)
-	parseResetTime(limits.SevenDayOpus)
+	parseResetTime(limits.SevenDaySonnet)
 
 	limits.LastUpdated = time.Now()
 	return &limits, nil
