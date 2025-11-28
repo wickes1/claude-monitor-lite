@@ -29,7 +29,8 @@ jobs:
 
       - name: Build
         run: |
-          CGO_ENABLED=1 go build -ldflags="-s -w" -trimpath -o claude-monitor-lite
+          VERSION=${GITHUB_REF#refs/tags/}
+          CGO_ENABLED=1 go build -ldflags="-s -w -X main.version=${VERSION}" -trimpath -o claude-monitor-lite
           tar -czvf claude-monitor-lite_Linux_x86_64.tar.gz claude-monitor-lite
           sha256sum claude-monitor-lite_Linux_x86_64.tar.gz > linux_checksums.txt
 

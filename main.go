@@ -24,6 +24,9 @@ const (
 	pidFilePermissions = 0644 // Owner read/write, others read
 )
 
+// version is set via ldflags at build time (e.g., -X main.version=v1.0.0)
+var version = "dev"
+
 var (
 	// Menu items (also serve as indicator selectors)
 	mCurrentSession *systray.MenuItem
@@ -223,6 +226,9 @@ func main() {
 			handleLogout()
 		case "renew":
 			HandleRenewCommand(os.Args[2:])
+		case "version", "--version", "-v":
+			fmt.Printf("claude-monitor-lite %s\n", version)
+			os.Exit(0)
 		case "help", "--help", "-h":
 			printUsage()
 			os.Exit(0)
@@ -239,7 +245,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Claude Monitor Lite - Menu bar monitor for Claude usage")
+	fmt.Printf("Claude Monitor Lite %s - Menu bar monitor for Claude usage\n", version)
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  claude-monitor-lite              Start monitor (login if needed, show status if running)")
@@ -247,6 +253,7 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
 	fmt.Println("  claude-monitor-lite logout       Clear session and stop monitor")
 	fmt.Println("  claude-monitor-lite renew <cmd>  Auto-renew session management")
+	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
 	fmt.Println()
 	fmt.Println("Auto-Renew Commands:")
@@ -544,6 +551,7 @@ func onReady() {
 
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
 	mOpenConfig := systray.AddMenuItem("Open Config", "Open config file in editor")
+	mAbout := systray.AddMenuItem("About", "Show version info")
 	systray.AddSeparator()
 
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
@@ -585,6 +593,11 @@ func onReady() {
 					homeDir, _ := os.UserHomeDir()
 					configPath := filepath.Join(homeDir, ".claude-monitor-lite.json")
 					exec.Command("open", configPath).Start()
+				}()
+			case <-mAbout.ClickedCh:
+				go func() {
+					exec.Command("osascript", "-e",
+						fmt.Sprintf(`display dialog "Claude Monitor Lite\nVersion: %s" buttons {"OK"} default button "OK" with title "About"`, version)).Start()
 				}()
 			case <-mCurrentSession.ClickedCh:
 				appConfig.MenuBarIndicator = "currentSession"
