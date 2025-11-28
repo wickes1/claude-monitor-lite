@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	// Time window tolerance for schedule matching (in minutes)
-	scheduleToleranceMinutes = 2
+	// Time window tolerance for schedule matching
+	// Also serves as retry window (~3 attempts at 30s intervals)
+	scheduleToleranceSeconds = 90
 	// Log file for auto-renew events
 	renewLogFileName = ".claude-monitor-lite-renew.log"
 )
@@ -39,13 +40,14 @@ func CheckAndTriggerAutoRenew(config *Config) {
 
 			if err := SendActivationMessage(message); err != nil {
 				logRenewEvent(fmt.Sprintf("Auto-renew failed: %v", err))
+				if updateErr := UpdateAutoRenewLastFailed(scheduledTime, currentDate, err.Error()); updateErr != nil {
+					logRenewEvent(fmt.Sprintf("Failed to update lastFailed: %v", updateErr))
+				}
 			} else {
 				logRenewEvent(fmt.Sprintf("Auto-renew successful with message: %s", message))
-				// Update lastSent to prevent duplicate sends today
 				if err := UpdateAutoRenewLastSent(scheduledTime, currentDate); err != nil {
 					logRenewEvent(fmt.Sprintf("Failed to update lastSent: %v", err))
 				}
-				// Reload config to update in-memory state
 				*config = LoadConfig()
 			}
 		}
@@ -65,9 +67,9 @@ func shouldTrigger(currentTime, scheduledTime string, lastSent map[string]string
 		return false
 	}
 
-	// Check if within tolerance window (current time is within X minutes after scheduled time)
+	// Check if within tolerance window (current time is within X seconds after scheduled time)
 	diff := current.Sub(scheduled)
-	if diff < 0 || diff > time.Duration(scheduleToleranceMinutes)*time.Minute {
+	if diff < 0 || diff > time.Duration(scheduleToleranceSeconds)*time.Second {
 		return false
 	}
 

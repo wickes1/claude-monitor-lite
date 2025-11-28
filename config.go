@@ -20,10 +20,16 @@ type Config struct {
 }
 
 type AutoRenew struct {
-	Enabled  bool              `json:"enabled"`
-	Schedule []string          `json:"schedule"` // e.g., ["09:00", "14:00"]
-	Message  string            `json:"message"`  // e.g., "hello"
-	LastSent map[string]string `json:"lastSent"` // e.g., {"09:00": "2025-01-28"}
+	Enabled    bool                      `json:"enabled"`
+	Schedule   []string                  `json:"schedule"`   // e.g., ["09:00", "14:00"]
+	Message    string                    `json:"message"`    // e.g., "hello"
+	LastSent   map[string]string         `json:"lastSent"`   // e.g., {"09:00": "2025-01-28"}
+	LastFailed map[string]*FailedAttempt `json:"lastFailed"` // e.g., {"09:00": {"date": "2025-01-28", "error": "..."}}
+}
+
+type FailedAttempt struct {
+	Date  string `json:"date"`
+	Error string `json:"error"`
 }
 
 func GetConfigPath() string {
@@ -101,5 +107,22 @@ func UpdateAutoRenewLastSent(scheduleTime, date string) error {
 			c.AutoRenew.LastSent = make(map[string]string)
 		}
 		c.AutoRenew.LastSent[scheduleTime] = date
+		// Clear any previous failure for this schedule time on success
+		if c.AutoRenew.LastFailed != nil {
+			delete(c.AutoRenew.LastFailed, scheduleTime)
+		}
+	})
+}
+
+// UpdateAutoRenewLastFailed records a failed auto-renew attempt
+func UpdateAutoRenewLastFailed(scheduleTime, date, errMsg string) error {
+	return modifyAndSaveConfig(func(c *Config) {
+		if c.AutoRenew.LastFailed == nil {
+			c.AutoRenew.LastFailed = make(map[string]*FailedAttempt)
+		}
+		c.AutoRenew.LastFailed[scheduleTime] = &FailedAttempt{
+			Date:  date,
+			Error: errMsg,
+		}
 	})
 }
