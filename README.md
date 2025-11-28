@@ -59,6 +59,8 @@ claude-monitor-lite renew <cmd>  # Auto-renew management
 
 Schedule automatic session activation to maximize your 5-hour usage windows.
 
+**Requires:** [Claude Code](https://code.claude.com/docs) CLI installed.
+
 ```bash
 # Set daily trigger times
 claude-monitor-lite renew --schedule 09:00,14:00
