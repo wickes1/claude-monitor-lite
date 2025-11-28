@@ -84,6 +84,10 @@ claude-monitor-lite renew log
 
 **How it works:** At scheduled times, the daemon sends a message to Claude CLI (`claude -p "hello"`) to activate a new 5-hour session window. This ensures your usage windows align with your work schedule.
 
+**Retry behavior:**
+- Triggers within 1.5-minute window (~3 retries at 30s intervals)
+- Only records successful activations (failed attempts don't block next day)
+
 ## Troubleshooting
 
 **Session expired:** Run `claude-monitor-lite logout` then restart.
