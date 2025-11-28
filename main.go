@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -542,6 +543,7 @@ func onReady() {
 	systray.AddSeparator()
 
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
+	mOpenConfig := systray.AddMenuItem("Open Config", "Open config file in editor")
 	systray.AddSeparator()
 
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
@@ -577,6 +579,12 @@ func onReady() {
 					config.AutoRenew.Enabled = !config.AutoRenew.Enabled
 					SaveAutoRenewConfig(config.AutoRenew)
 					updateAutoRenewMenu()
+				}()
+			case <-mOpenConfig.ClickedCh:
+				go func() {
+					homeDir, _ := os.UserHomeDir()
+					configPath := filepath.Join(homeDir, ".claude-monitor-lite.json")
+					exec.Command("open", configPath).Start()
 				}()
 			case <-mCurrentSession.ClickedCh:
 				appConfig.MenuBarIndicator = "currentSession"
