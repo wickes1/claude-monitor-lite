@@ -9,7 +9,40 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgtk-3-dev libayatana-appindicator3-dev
+
+      - name: Build
+        run: |
+          CGO_ENABLED=1 go build -ldflags="-s -w" -trimpath -o claude-monitor-lite
+          tar -czvf claude-monitor-lite_Linux_x86_64.tar.gz claude-monitor-lite
+          sha256sum claude-monitor-lite_Linux_x86_64.tar.gz > linux_checksums.txt
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            claude-monitor-lite_Linux_x86_64.tar.gz
+            linux_checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+  release-macos:
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -29,6 +62,4 @@ jobs:
           version: latest
           args: release --clean
         env:
-          # GH_PAT is a custom Personal Access Token with repo scope
-          # Created manually in: Settings → Secrets → Actions
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}

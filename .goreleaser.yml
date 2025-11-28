@@ -18,9 +18,7 @@ builds:
       - -trimpath
 
 archives:
-  - format_overrides:
-      - goos: darwin
-        formats: ['tar.gz']
+  - format: tar.gz
     name_template: >-
       {{ .ProjectName }}_
       {{- title .Os }}_
