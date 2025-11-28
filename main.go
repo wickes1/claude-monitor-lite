@@ -28,6 +28,9 @@ var (
 	mWeeklyAll      *systray.MenuItem
 	mWeeklySonnet   *systray.MenuItem
 
+	// Auto-renew menu item
+	mAutoRenew *systray.MenuItem
+
 	// Refresh button
 	mRefresh *systray.MenuItem
 
@@ -214,6 +217,8 @@ func main() {
 			handleStop()
 		case "logout":
 			handleLogout()
+		case "renew":
+			HandleRenewCommand(os.Args[2:])
 		case "help", "--help", "-h":
 			printUsage()
 			os.Exit(0)
@@ -233,10 +238,19 @@ func printUsage() {
 	fmt.Println("Claude Monitor Lite - Menu bar monitor for Claude usage")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  claude-monitor-lite           Auto-start (login if needed, show status if running)")
-	fmt.Println("  claude-monitor-lite stop      Stop the monitor")
-	fmt.Println("  claude-monitor-lite logout    Clear session and stop monitor")
-	fmt.Println("  claude-monitor-lite help      Show this help")
+	fmt.Println("  claude-monitor-lite              Auto-start (login if needed, show status if running)")
+	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
+	fmt.Println("  claude-monitor-lite logout       Clear session and stop monitor")
+	fmt.Println("  claude-monitor-lite renew <cmd>  Auto-renew session management")
+	fmt.Println("  claude-monitor-lite help         Show this help")
+	fmt.Println()
+	fmt.Println("Auto-Renew Commands:")
+	fmt.Println("  renew on                    Enable scheduled auto-renew")
+	fmt.Println("  renew off                   Disable auto-renew")
+	fmt.Println("  renew now                   Send activation message now")
+	fmt.Println("  renew status                Show auto-renew settings")
+	fmt.Println("  renew --schedule 09:00,14:00   Set daily trigger times")
+	fmt.Println("  renew --message \"hello\"        Set activation message")
 	fmt.Println()
 	fmt.Println("First time? Just run: claude-monitor-lite")
 }
@@ -519,6 +533,11 @@ func onReady() {
 	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
 	systray.AddSeparator()
 
+	// Auto-renew status
+	mAutoRenew = systray.AddMenuItem(getAutoRenewMenuTitle(), "Auto-renew status")
+	mAutoRenew.Disable() // Display only, not clickable
+	systray.AddSeparator()
+
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
 	systray.AddSeparator()
 
@@ -537,6 +556,12 @@ func onReady() {
 				return
 			case <-ticker.C:
 				go updateStats()
+				// Check auto-renew schedule and update menu
+				go func() {
+					config := LoadConfig()
+					CheckAndTriggerAutoRenew(&config)
+					updateAutoRenewMenu()
+				}()
 			case <-mQuit.ClickedCh:
 				appCancel()
 				systray.Quit()
@@ -592,6 +617,25 @@ func updateMenuCheckmarks() {
 		mWeeklySonnet.Check()
 	default:
 		mCurrentSession.Check()
+	}
+}
+
+func getAutoRenewMenuTitle() string {
+	config := LoadConfig()
+	if !config.AutoRenew.Enabled {
+		return "Auto-Renew: OFF"
+	}
+
+	next := GetNextScheduledTime(&config)
+	if next != "" {
+		return fmt.Sprintf("Auto-Renew: ON (next: %s)", next)
+	}
+	return "Auto-Renew: ON"
+}
+
+func updateAutoRenewMenu() {
+	if mAutoRenew != nil {
+		mAutoRenew.SetTitle(getAutoRenewMenuTitle())
 	}
 }
 

@@ -16,6 +16,14 @@ type Config struct {
 	OrganizationID   string     `json:"organizationId,omitempty"`
 	SavedAt          *time.Time `json:"savedAt,omitempty"`
 	MenuBarIndicator string     `json:"menuBarIndicator"`
+	AutoRenew        AutoRenew  `json:"autoRenew,omitempty"`
+}
+
+type AutoRenew struct {
+	Enabled  bool              `json:"enabled"`
+	Schedule []string          `json:"schedule"` // e.g., ["09:00", "14:00"]
+	Message  string            `json:"message"`  // e.g., "hello"
+	LastSent map[string]string `json:"lastSent"` // e.g., {"09:00": "2025-01-28"}
 }
 
 func GetConfigPath() string {
@@ -51,28 +59,47 @@ func SaveConfig(config Config) error {
 	return os.WriteFile(GetConfigPath(), data, configFilePermissions)
 }
 
-// SaveConfigPreservingSession updates only menuBarIndicator, preserving session fields
-func SaveConfigPreservingSession(menuBarIndicator string) error {
-	// Read the current file to preserve session fields
+// modifyAndSaveConfig reads existing config, applies modifier function, and saves
+func modifyAndSaveConfig(modifier func(*Config)) error {
 	path := GetConfigPath()
 	existingData, err := os.ReadFile(path)
 
-	var existing Config
+	var config Config
 	if err == nil {
-		// File exists, parse it to preserve session fields
-		// If unmarshal fails, existing will be zero-valued (safe)
-		if unmarshalErr := json.Unmarshal(existingData, &existing); unmarshalErr != nil {
-			// On parse error, start fresh with just the menuBarIndicator
-			existing = Config{}
+		if unmarshalErr := json.Unmarshal(existingData, &config); unmarshalErr != nil {
+			config = Config{}
 		}
 	}
 
-	// Only update the menuBarIndicator
-	existing.MenuBarIndicator = menuBarIndicator
+	modifier(&config)
 
-	data, err := json.MarshalIndent(existing, "", "  ")
+	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, configFilePermissions)
+}
+
+// SaveConfigPreservingSession updates only menuBarIndicator, preserving other fields
+func SaveConfigPreservingSession(menuBarIndicator string) error {
+	return modifyAndSaveConfig(func(c *Config) {
+		c.MenuBarIndicator = menuBarIndicator
+	})
+}
+
+// SaveAutoRenewConfig updates only autoRenew settings, preserving other fields
+func SaveAutoRenewConfig(autoRenew AutoRenew) error {
+	return modifyAndSaveConfig(func(c *Config) {
+		c.AutoRenew = autoRenew
+	})
+}
+
+// UpdateAutoRenewLastSent updates only the lastSent map for auto-renew
+func UpdateAutoRenewLastSent(scheduleTime, date string) error {
+	return modifyAndSaveConfig(func(c *Config) {
+		if c.AutoRenew.LastSent == nil {
+			c.AutoRenew.LastSent = make(map[string]string)
+		}
+		c.AutoRenew.LastSent[scheduleTime] = date
+	})
 }
