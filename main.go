@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -213,6 +214,8 @@ func main() {
 
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "start":
+			handleAutoStart()
 		case "stop":
 			handleStop()
 		case "logout":
@@ -238,7 +241,8 @@ func printUsage() {
 	fmt.Println("Claude Monitor Lite - Menu bar monitor for Claude usage")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  claude-monitor-lite              Auto-start (login if needed, show status if running)")
+	fmt.Println("  claude-monitor-lite              Start monitor (login if needed, show status if running)")
+	fmt.Println("  claude-monitor-lite start        Same as above")
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
 	fmt.Println("  claude-monitor-lite logout       Clear session and stop monitor")
 	fmt.Println("  claude-monitor-lite renew <cmd>  Auto-renew session management")
@@ -533,9 +537,8 @@ func onReady() {
 	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
 	systray.AddSeparator()
 
-	// Auto-renew status
-	mAutoRenew = systray.AddMenuItem(getAutoRenewMenuTitle(), "Auto-renew status")
-	mAutoRenew.Disable() // Display only, not clickable
+	// Auto-renew toggle
+	mAutoRenew = systray.AddMenuItem(getAutoRenewMenuTitle(), "Click to toggle auto-renew")
 	systray.AddSeparator()
 
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
@@ -568,6 +571,13 @@ func onReady() {
 				return
 			case <-mRefresh.ClickedCh:
 				go updateStats()
+			case <-mAutoRenew.ClickedCh:
+				go func() {
+					config := LoadConfig()
+					config.AutoRenew.Enabled = !config.AutoRenew.Enabled
+					SaveAutoRenewConfig(config.AutoRenew)
+					updateAutoRenewMenu()
+				}()
 			case <-mCurrentSession.ClickedCh:
 				appConfig.MenuBarIndicator = "currentSession"
 				updateMenuCheckmarks()
@@ -622,15 +632,20 @@ func updateMenuCheckmarks() {
 
 func getAutoRenewMenuTitle() string {
 	config := LoadConfig()
+	schedule := ""
+	if len(config.AutoRenew.Schedule) > 0 {
+		schedule = " (" + strings.Join(config.AutoRenew.Schedule, ", ") + ")"
+	}
+
 	if !config.AutoRenew.Enabled {
-		return "Auto-Renew: OFF"
+		return "Auto-Renew: OFF" + schedule
 	}
 
 	next := GetNextScheduledTime(&config)
 	if next != "" {
-		return fmt.Sprintf("Auto-Renew: ON (next: %s)", next)
+		return fmt.Sprintf("Auto-Renew: ON%s (next: %s)", schedule, next)
 	}
-	return "Auto-Renew: ON"
+	return "Auto-Renew: ON" + schedule
 }
 
 func updateAutoRenewMenu() {
