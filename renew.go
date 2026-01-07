@@ -16,7 +16,17 @@ const (
 	scheduleToleranceSeconds = 90
 	// Log file for auto-renew events
 	renewLogFileName = ".claude-monitor-lite-renew.log"
+	// Default message for auto-renew
+	defaultRenewMessage = "hello"
 )
+
+// getMessageOrDefault returns the configured message or default
+func getMessageOrDefault(config *Config) string {
+	if config.AutoRenew.Message != "" {
+		return config.AutoRenew.Message
+	}
+	return defaultRenewMessage
+}
 
 // CheckAndTriggerAutoRenew checks if current time matches any scheduled time
 // and triggers activation if not already sent today
@@ -31,10 +41,7 @@ func CheckAndTriggerAutoRenew(config *Config) {
 
 	for _, scheduledTime := range config.AutoRenew.Schedule {
 		if shouldTrigger(currentTime, scheduledTime, config.AutoRenew.LastSent, currentDate) {
-			message := config.AutoRenew.Message
-			if message == "" {
-				message = "hello"
-			}
+			message := getMessageOrDefault(config)
 
 			logRenewEvent(fmt.Sprintf("Triggering auto-renew at %s (scheduled: %s)", currentTime, scheduledTime))
 
@@ -225,10 +232,7 @@ func HandleRenewCommand(args []string) {
 		fmt.Println("Auto-renew disabled.")
 
 	case "now":
-		message := config.AutoRenew.Message
-		if message == "" {
-			message = "hello"
-		}
+		message := getMessageOrDefault(&config)
 		// Check for custom message in args
 		for i, arg := range args {
 			if arg == "--message" && i+1 < len(args) {
@@ -316,7 +320,7 @@ func printAutoRenewStatus(config *Config) {
 
 	message := config.AutoRenew.Message
 	if message == "" {
-		message = "hello (default)"
+		message = defaultRenewMessage + " (default)"
 	}
 	fmt.Printf("  Message:  %s\n", message)
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -36,23 +35,21 @@ func LoadAuthSession() (*AuthSession, error) {
 func SaveAuthSession(session *AuthSession) error {
 	session.SavedAt = time.Now()
 
-	// Read existing config to preserve menuBarIndicator
-	existing := LoadConfig()
-	existing.SessionKey = session.SessionKey
-	existing.OrganizationID = session.OrganizationID
-	existing.SavedAt = &session.SavedAt
-
-	return SaveConfig(existing)
+	// Only update auth fields, preserving other settings (autoRenew, menuBarIndicator)
+	return modifyAndSaveConfig(func(c *Config) {
+		c.SessionKey = session.SessionKey
+		c.OrganizationID = session.OrganizationID
+		c.SavedAt = &session.SavedAt
+	})
 }
 
 func ClearAuthSession() error {
-	// Completely remove the config file for clean uninstall
-	configPath := GetConfigPath()
-	err := os.Remove(configPath)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	// Only clear auth-related fields, preserve other settings (autoRenew, menuBarIndicator)
+	return modifyAndSaveConfig(func(c *Config) {
+		c.SessionKey = ""
+		c.OrganizationID = ""
+		c.SavedAt = nil
+	})
 }
 
 // LoginWithBrowser opens browser and guides user through manual session key extraction

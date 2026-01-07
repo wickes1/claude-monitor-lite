@@ -57,14 +57,6 @@ func LoadConfig() Config {
 	return config
 }
 
-func SaveConfig(config Config) error {
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(GetConfigPath(), data, configFilePermissions)
-}
-
 // modifyAndSaveConfig reads existing config, applies modifier function, and saves
 func modifyAndSaveConfig(modifier func(*Config)) error {
 	path := GetConfigPath()

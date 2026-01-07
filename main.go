@@ -462,12 +462,12 @@ func handleLogout() {
 		}
 	}
 
-	// Clear session and config
+	// Clear session data only (preserves auto-renew and menu bar settings)
 	if err := ClearAuthSession(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to clear session: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("✓ Logged out! All config and session data removed.")
+	fmt.Println("✓ Logged out! Session data cleared.")
 }
 
 func isRunning() bool {
