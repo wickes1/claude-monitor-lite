@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -24,6 +27,7 @@ var (
 	ErrAuthFailed     = errors.New("authentication failed - session may have expired")
 	ErrOrgIDNotFound  = errors.New("organization ID not found in response")
 	ErrSessionExpired = errors.New("session expired")
+	ErrTransient      = errors.New("transient error")
 )
 
 // Shared HTTP client for connection pooling
@@ -42,6 +46,8 @@ type UsageLimits struct {
 	SevenDay          *UsageLimit `json:"seven_day,omitempty"`
 	SevenDayOAuthApps *UsageLimit `json:"seven_day_oauth_apps,omitempty"`
 	SevenDaySonnet    *UsageLimit `json:"seven_day_sonnet,omitempty"`
+	SevenDayOpus      *UsageLimit `json:"seven_day_opus,omitempty"`
+	SevenDayCowork    *UsageLimit `json:"seven_day_cowork,omitempty"`
 	IguanaNecktie     *UsageLimit `json:"iguana_necktie,omitempty"`
 	ExtraUsage        *UsageLimit `json:"extra_usage,omitempty"`
 	LastUpdated       time.Time   `json:"-"`
@@ -54,8 +60,12 @@ type UsageLimit struct {
 }
 
 func newHTTPClient() *http.Client {
+	// Use a cookie jar to automatically handle Cloudflare cookies
+	// (__cf_bm, _cfuvid) and session key refreshes from Set-Cookie headers
+	jar, _ := cookiejar.New(nil)
 	return &http.Client{
 		Timeout: requestTimeout,
+		Jar:     jar,
 		Transport: &http.Transport{
 			MaxIdleConns:        maxIdleConns,
 			MaxIdleConnsPerHost: maxIdleConnsPerHost,
@@ -67,18 +77,70 @@ func newHTTPClient() *http.Client {
 }
 
 func NewClaudeUsageClient(sessionKey string) *ClaudeUsageClient {
-	return &ClaudeUsageClient{
+	client := &ClaudeUsageClient{
 		sessionKey: sessionKey,
 		httpClient: sharedHTTPClient,
 	}
+	client.seedCookieJar()
+	return client
 }
 
 func NewClaudeUsageClientWithOrg(sessionKey, organizationID string) *ClaudeUsageClient {
-	return &ClaudeUsageClient{
+	client := &ClaudeUsageClient{
 		sessionKey:     sessionKey,
 		organizationID: organizationID,
 		httpClient:     sharedHTTPClient,
 	}
+	client.seedCookieJar()
+	return client
+}
+
+// seedCookieJar sets the initial sessionKey cookie in the jar so
+// subsequent requests via the jar include it automatically.
+func (c *ClaudeUsageClient) seedCookieJar() {
+	u, _ := url.Parse("https://claude.ai")
+	c.httpClient.Jar.SetCookies(u, []*http.Cookie{
+		{Name: "sessionKey", Value: c.sessionKey},
+	})
+}
+
+// refreshSessionFromJar checks if the API returned a new sessionKey
+// via Set-Cookie and updates the client + persisted config.
+func (c *ClaudeUsageClient) refreshSessionFromJar() {
+	u, _ := url.Parse("https://claude.ai")
+	for _, cookie := range c.httpClient.Jar.Cookies(u) {
+		if cookie.Name == "sessionKey" && cookie.Value != "" && cookie.Value != c.sessionKey {
+			c.sessionKey = cookie.Value
+			// Persist the refreshed key to config in background
+			go func(newKey string) {
+				modifyAndSaveConfig(func(cfg *Config) {
+					cfg.SessionKey = newKey
+				})
+			}(cookie.Value)
+			return
+		}
+	}
+}
+
+// doAPIRequest performs an authenticated GET request with proper headers.
+func (c *ClaudeUsageClient) doAPIRequest(ctx context.Context, apiURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	return c.httpClient.Do(req)
+}
+
+// isTransientStatus returns true for HTTP status codes that indicate a
+// temporary problem (server error, rate limit, Cloudflare challenge).
+func isTransientStatus(code int) bool {
+	return code == http.StatusTooManyRequests ||
+		code >= 500 ||
+		code == http.StatusServiceUnavailable
 }
 
 // GetUsageLimits fetches real-time usage limits from Claude API
@@ -91,29 +153,39 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	}
 
 	// Build the actual endpoint
-	url := fmt.Sprintf("%s/organizations/%s/usage", claudeAPIBaseURL, c.organizationID)
+	apiURL := fmt.Sprintf("%s/organizations/%s/usage", claudeAPIBaseURL, c.organizationID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := c.doAPIRequest(ctx, apiURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set authentication cookie
-	req.Header.Set("Cookie", fmt.Sprintf("sessionKey=%s", c.sessionKey))
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch usage limits: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrTransient, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	// Pick up any refreshed sessionKey or Cloudflare cookies
+	c.refreshSessionFromJar()
+
+	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, fmt.Errorf("%w (status %d)", ErrAuthFailed, resp.StatusCode)
+	}
+
+	// 403 could be Cloudflare bot challenge, not necessarily auth failure
+	if resp.StatusCode == http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		// Check if this is a real auth failure or a Cloudflare challenge
+		if strings.Contains(bodyStr, "cloudflare") || strings.Contains(bodyStr, "cf-") ||
+			strings.Contains(bodyStr, "challenge") || strings.Contains(bodyStr, "<!DOCTYPE") {
+			return nil, fmt.Errorf("%w: cloudflare challenge (status 403)", ErrTransient)
+		}
+		return nil, fmt.Errorf("%w (status %d)", ErrAuthFailed, resp.StatusCode)
+	}
+
+	if isTransientStatus(resp.StatusCode) {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%w: status %d: %s", ErrTransient, resp.StatusCode, string(body))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -123,7 +195,7 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, fmt.Errorf("%w: failed to read response: %v", ErrTransient, err)
 	}
 
 	var limits UsageLimits
@@ -142,6 +214,8 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	parseResetTime(limits.FiveHour)
 	parseResetTime(limits.SevenDay)
 	parseResetTime(limits.SevenDaySonnet)
+	parseResetTime(limits.SevenDayOpus)
+	parseResetTime(limits.SevenDayCowork)
 
 	limits.LastUpdated = time.Now()
 	return &limits, nil
@@ -149,26 +223,18 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 
 // fetchOrganizationID retrieves the organization ID from the account endpoint
 func (c *ClaudeUsageClient) fetchOrganizationID() error {
-	// Try to get organization ID from account/organizations endpoint
-	url := fmt.Sprintf("%s/organizations", claudeAPIBaseURL)
+	apiURL := fmt.Sprintf("%s/organizations", claudeAPIBaseURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Cookie", fmt.Sprintf("sessionKey=%s", c.sessionKey))
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doAPIRequest(ctx, apiURL)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+
+	c.refreshSessionFromJar()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to fetch organizations (status %d)", resp.StatusCode)

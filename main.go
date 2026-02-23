@@ -32,6 +32,8 @@ var (
 	mCurrentSession *systray.MenuItem
 	mWeeklyAll      *systray.MenuItem
 	mWeeklySonnet   *systray.MenuItem
+	mWeeklyOpus     *systray.MenuItem
+	mWeeklyCowork   *systray.MenuItem
 
 	// Auto-renew menu item
 	mAutoRenew *systray.MenuItem
@@ -47,6 +49,10 @@ var (
 	// Last fetched limits for instant display switching (protected by mutex)
 	lastLimits  *UsageLimits
 	limitsMutex sync.RWMutex
+
+	// Consecutive error tracking for transient error resilience
+	consecutiveErrors int
+	consecutiveMutex  sync.Mutex
 
 	// Context for graceful shutdown
 	appCtx    context.Context
@@ -173,6 +179,10 @@ func getSelectedLimit(limits *UsageLimits, indicator string) *UsageLimit {
 		return limits.SevenDay
 	case "weeklySonnet":
 		return limits.SevenDaySonnet
+	case "weeklyOpus":
+		return limits.SevenDayOpus
+	case "weeklyCowork":
+		return limits.SevenDayCowork
 	default:
 		return limits.FiveHour
 	}
@@ -184,6 +194,12 @@ func displayUsageStats(limits *UsageLimits) {
 	fmt.Print(formatConsoleUsage(limits.FiveHour, "5-Hour Session:", "no active session"))
 	fmt.Print(formatConsoleUsage(limits.SevenDay, "Weekly (All):", ""))
 	fmt.Print(formatConsoleUsage(limits.SevenDaySonnet, "Weekly (Sonnet):", ""))
+	if limits.SevenDayOpus != nil {
+		fmt.Print(formatConsoleUsage(limits.SevenDayOpus, "Weekly (Opus):", ""))
+	}
+	if limits.SevenDayCowork != nil {
+		fmt.Print(formatConsoleUsage(limits.SevenDayCowork, "Weekly (Cowork):", ""))
+	}
 	fmt.Println()
 }
 
@@ -364,6 +380,8 @@ func handleStatusDisplay() {
 		"currentSession": "5-Hour Session",
 		"weeklyAll":      "Weekly (All)",
 		"weeklySonnet":   "Weekly (Sonnet)",
+		"weeklyOpus":     "Weekly (Opus)",
+		"weeklyCowork":   "Weekly (Cowork)",
 	}
 
 	indicatorName := indicatorNames[appConfig.MenuBarIndicator]
@@ -543,6 +561,8 @@ func onReady() {
 	mCurrentSession = systray.AddMenuItem("5-Hour Session: --", "Click to show in menu bar")
 	mWeeklyAll = systray.AddMenuItem("Weekly (All): --", "Click to show in menu bar")
 	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
+	mWeeklyOpus = systray.AddMenuItem("Weekly (Opus): --", "Click to show in menu bar")
+	mWeeklyCowork = systray.AddMenuItem("Weekly (Cowork): --", "Click to show in menu bar")
 	systray.AddSeparator()
 
 	// Auto-renew toggle
@@ -629,6 +649,26 @@ func onReady() {
 					updateMenuBarDisplay(cached)
 				}
 				go SaveConfigPreservingSession("weeklySonnet")
+		case <-mWeeklyOpus.ClickedCh:
+			appConfig.MenuBarIndicator = "weeklyOpus"
+			updateMenuCheckmarks()
+			limitsMutex.RLock()
+			cached := lastLimits
+			limitsMutex.RUnlock()
+			if cached != nil {
+				updateMenuBarDisplay(cached)
+			}
+			go SaveConfigPreservingSession("weeklyOpus")
+		case <-mWeeklyCowork.ClickedCh:
+			appConfig.MenuBarIndicator = "weeklyCowork"
+			updateMenuCheckmarks()
+			limitsMutex.RLock()
+			cached := lastLimits
+			limitsMutex.RUnlock()
+			if cached != nil {
+				updateMenuBarDisplay(cached)
+			}
+			go SaveConfigPreservingSession("weeklyCowork")
 			}
 		}
 	}()
@@ -638,6 +678,8 @@ func updateMenuCheckmarks() {
 	mCurrentSession.Uncheck()
 	mWeeklyAll.Uncheck()
 	mWeeklySonnet.Uncheck()
+	mWeeklyOpus.Uncheck()
+	mWeeklyCowork.Uncheck()
 
 	switch appConfig.MenuBarIndicator {
 	case "currentSession":
@@ -646,6 +688,10 @@ func updateMenuCheckmarks() {
 		mWeeklyAll.Check()
 	case "weeklySonnet":
 		mWeeklySonnet.Check()
+	case "weeklyOpus":
+		mWeeklyOpus.Check()
+	case "weeklyCowork":
+		mWeeklyCowork.Check()
 	default:
 		mCurrentSession.Check()
 	}
@@ -675,6 +721,10 @@ func updateAutoRenewMenu() {
 	}
 }
 
+// maxTransientErrors is the number of consecutive transient failures tolerated
+// before showing an error in the menu bar. At 30s intervals, 3 = ~1.5 minutes.
+const maxTransientErrors = 3
+
 func updateStats() {
 	if claudeClient == nil {
 		systray.SetTitle("⚪ Error")
@@ -683,20 +733,42 @@ func updateStats() {
 
 	limits, err := claudeClient.GetUsageLimits()
 	if err != nil {
-		systray.SetTitle("⚪ Error")
-		mCurrentSession.SetTitle("Error loading data")
+		consecutiveMutex.Lock()
+		consecutiveErrors++
+		count := consecutiveErrors
+		consecutiveMutex.Unlock()
 
-		// Check if session expired using typed error
+		// Real auth failure — show immediately
 		if errors.Is(err, ErrAuthFailed) {
 			mCurrentSession.SetTitle("Session expired - please login again")
+			systray.SetTitle("⚪ Login")
+			return
 		}
+
+		// Transient error — keep showing last good data if within tolerance
+		if errors.Is(err, ErrTransient) && count <= maxTransientErrors {
+			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
+			return // keep current display unchanged
+		}
+
+		// Exceeded tolerance or unknown error — show error state
+		log.Printf("Error fetching usage: %v", err)
+		systray.SetTitle("⚪ Error")
+		mCurrentSession.SetTitle("Error loading data")
 		return
 	}
+
+	// Success — reset error counter
+	consecutiveMutex.Lock()
+	consecutiveErrors = 0
+	consecutiveMutex.Unlock()
 
 	// Update menu items using helper functions
 	mCurrentSession.SetTitle(formatUsageWithReset(limits.FiveHour, "5-Hour Session:"))
 	mWeeklyAll.SetTitle(formatUsageWithReset(limits.SevenDay, "Weekly (All):"))
 	mWeeklySonnet.SetTitle(formatUsageWithReset(limits.SevenDaySonnet, "Weekly (Sonnet):"))
+	mWeeklyOpus.SetTitle(formatUsageWithReset(limits.SevenDayOpus, "Weekly (Opus):"))
+	mWeeklyCowork.SetTitle(formatUsageWithReset(limits.SevenDayCowork, "Weekly (Cowork):"))
 
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()
