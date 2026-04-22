@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,14 +28,12 @@ var version = "dev"
 
 var (
 	// Menu items (also serve as indicator selectors)
-	mCurrentSession *systray.MenuItem
-	mWeeklyAll      *systray.MenuItem
-	mWeeklySonnet   *systray.MenuItem
-	mWeeklyOpus     *systray.MenuItem
-	mWeeklyCowork   *systray.MenuItem
-
-	// Auto-renew menu item
-	mAutoRenew *systray.MenuItem
+	mCurrentSession  *systray.MenuItem
+	mWeeklyAll       *systray.MenuItem
+	mWeeklySonnet    *systray.MenuItem
+	mWeeklyOpus      *systray.MenuItem
+	mWeeklyCowork    *systray.MenuItem
+	mWeeklyDesign    *systray.MenuItem
 
 	// Refresh button
 	mRefresh *systray.MenuItem
@@ -183,6 +180,8 @@ func getSelectedLimit(limits *UsageLimits, indicator string) *UsageLimit {
 		return limits.SevenDayOpus
 	case "weeklyCowork":
 		return limits.SevenDayCowork
+	case "weeklyDesign":
+		return limits.SevenDayOmelette
 	default:
 		return limits.FiveHour
 	}
@@ -199,6 +198,9 @@ func displayUsageStats(limits *UsageLimits) {
 	}
 	if limits.SevenDayCowork != nil {
 		fmt.Print(formatConsoleUsage(limits.SevenDayCowork, "Weekly (Cowork):", ""))
+	}
+	if limits.SevenDayOmelette != nil {
+		fmt.Print(formatConsoleUsage(limits.SevenDayOmelette, "Weekly (Design):", ""))
 	}
 	fmt.Println()
 }
@@ -240,8 +242,6 @@ func main() {
 			handleStop()
 		case "logout":
 			handleLogout()
-		case "renew":
-			HandleRenewCommand(os.Args[2:])
 		case "version", "--version", "-v":
 			fmt.Printf("claude-monitor-lite %s\n", version)
 			os.Exit(0)
@@ -268,17 +268,8 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite start        Same as above")
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
 	fmt.Println("  claude-monitor-lite logout       Clear session and stop monitor")
-	fmt.Println("  claude-monitor-lite renew <cmd>  Auto-renew session management")
 	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
-	fmt.Println()
-	fmt.Println("Auto-Renew Commands:")
-	fmt.Println("  renew on                    Enable scheduled auto-renew")
-	fmt.Println("  renew off                   Disable auto-renew")
-	fmt.Println("  renew now                   Send activation message now")
-	fmt.Println("  renew status                Show auto-renew settings")
-	fmt.Println("  renew --schedule 09:00,14:00   Set daily trigger times")
-	fmt.Println("  renew --message \"hello\"        Set activation message")
 	fmt.Println()
 	fmt.Println("First time? Just run: claude-monitor-lite")
 }
@@ -377,11 +368,12 @@ func handleStatusDisplay() {
 
 	// Show which indicator is displayed in menu bar
 	indicatorNames := map[string]string{
-		"currentSession": "5-Hour Session",
-		"weeklyAll":      "Weekly (All)",
-		"weeklySonnet":   "Weekly (Sonnet)",
-		"weeklyOpus":     "Weekly (Opus)",
-		"weeklyCowork":   "Weekly (Cowork)",
+		"currentSession":  "5-Hour Session",
+		"weeklyAll":       "Weekly (All)",
+		"weeklySonnet":    "Weekly (Sonnet)",
+		"weeklyOpus":      "Weekly (Opus)",
+		"weeklyCowork":    "Weekly (Cowork)",
+		"weeklyDesign":  "Weekly (Design)",
 	}
 
 	indicatorName := indicatorNames[appConfig.MenuBarIndicator]
@@ -480,7 +472,7 @@ func handleLogout() {
 		}
 	}
 
-	// Clear session data only (preserves auto-renew and menu bar settings)
+	// Clear session data only (preserves menu bar settings)
 	if err := ClearAuthSession(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to clear session: %v\n", err)
 		os.Exit(1)
@@ -563,10 +555,7 @@ func onReady() {
 	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
 	mWeeklyOpus = systray.AddMenuItem("Weekly (Opus): --", "Click to show in menu bar")
 	mWeeklyCowork = systray.AddMenuItem("Weekly (Cowork): --", "Click to show in menu bar")
-	systray.AddSeparator()
-
-	// Auto-renew toggle
-	mAutoRenew = systray.AddMenuItem(getAutoRenewMenuTitle(), "Click to toggle auto-renew")
+	mWeeklyDesign = systray.AddMenuItem("Weekly (Design): --", "Click to show in menu bar")
 	systray.AddSeparator()
 
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
@@ -589,25 +578,12 @@ func onReady() {
 				return
 			case <-ticker.C:
 				go updateStats()
-				// Check auto-renew schedule and update menu
-				go func() {
-					config := LoadConfig()
-					CheckAndTriggerAutoRenew(&config)
-					updateAutoRenewMenu()
-				}()
 			case <-mQuit.ClickedCh:
 				appCancel()
 				systray.Quit()
 				return
 			case <-mRefresh.ClickedCh:
 				go updateStats()
-			case <-mAutoRenew.ClickedCh:
-				go func() {
-					config := LoadConfig()
-					config.AutoRenew.Enabled = !config.AutoRenew.Enabled
-					SaveAutoRenewConfig(config.AutoRenew)
-					updateAutoRenewMenu()
-				}()
 			case <-mOpenConfig.ClickedCh:
 				go func() {
 					homeDir, _ := os.UserHomeDir()
@@ -669,6 +645,16 @@ func onReady() {
 				updateMenuBarDisplay(cached)
 			}
 			go SaveConfigPreservingSession("weeklyCowork")
+		case <-mWeeklyDesign.ClickedCh:
+			appConfig.MenuBarIndicator = "weeklyDesign"
+			updateMenuCheckmarks()
+			limitsMutex.RLock()
+			cached := lastLimits
+			limitsMutex.RUnlock()
+			if cached != nil {
+				updateMenuBarDisplay(cached)
+			}
+			go SaveConfigPreservingSession("weeklyDesign")
 			}
 		}
 	}()
@@ -680,6 +666,7 @@ func updateMenuCheckmarks() {
 	mWeeklySonnet.Uncheck()
 	mWeeklyOpus.Uncheck()
 	mWeeklyCowork.Uncheck()
+	mWeeklyDesign.Uncheck()
 
 	switch appConfig.MenuBarIndicator {
 	case "currentSession":
@@ -692,34 +679,13 @@ func updateMenuCheckmarks() {
 		mWeeklyOpus.Check()
 	case "weeklyCowork":
 		mWeeklyCowork.Check()
+	case "weeklyDesign":
+		mWeeklyDesign.Check()
 	default:
 		mCurrentSession.Check()
 	}
 }
 
-func getAutoRenewMenuTitle() string {
-	config := LoadConfig()
-	schedule := ""
-	if len(config.AutoRenew.Schedule) > 0 {
-		schedule = " (" + strings.Join(config.AutoRenew.Schedule, ", ") + ")"
-	}
-
-	if !config.AutoRenew.Enabled {
-		return "Auto-Renew: OFF" + schedule
-	}
-
-	next := GetNextScheduledTime(&config)
-	if next != "" {
-		return fmt.Sprintf("Auto-Renew: ON%s (next: %s)", schedule, next)
-	}
-	return "Auto-Renew: ON" + schedule
-}
-
-func updateAutoRenewMenu() {
-	if mAutoRenew != nil {
-		mAutoRenew.SetTitle(getAutoRenewMenuTitle())
-	}
-}
 
 // maxTransientErrors is the number of consecutive transient failures tolerated
 // before showing an error in the menu bar. At 30s intervals, 3 = ~1.5 minutes.
@@ -769,6 +735,7 @@ func updateStats() {
 	mWeeklySonnet.SetTitle(formatUsageWithReset(limits.SevenDaySonnet, "Weekly (Sonnet):"))
 	mWeeklyOpus.SetTitle(formatUsageWithReset(limits.SevenDayOpus, "Weekly (Opus):"))
 	mWeeklyCowork.SetTitle(formatUsageWithReset(limits.SevenDayCowork, "Weekly (Cowork):"))
+	mWeeklyDesign.SetTitle(formatUsageWithReset(limits.SevenDayOmelette, "Weekly (Design):"))
 
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()

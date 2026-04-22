@@ -35,7 +35,7 @@ func LoadAuthSession() (*AuthSession, error) {
 func SaveAuthSession(session *AuthSession) error {
 	session.SavedAt = time.Now()
 
-	// Only update auth fields, preserving other settings (autoRenew, menuBarIndicator)
+	// Only update auth fields, preserving other settings (menuBarIndicator)
 	return modifyAndSaveConfig(func(c *Config) {
 		c.SessionKey = session.SessionKey
 		c.OrganizationID = session.OrganizationID
@@ -44,7 +44,7 @@ func SaveAuthSession(session *AuthSession) error {
 }
 
 func ClearAuthSession() error {
-	// Only clear auth-related fields, preserve other settings (autoRenew, menuBarIndicator)
+	// Only clear auth-related fields, preserve other settings (menuBarIndicator)
 	return modifyAndSaveConfig(func(c *Config) {
 		c.SessionKey = ""
 		c.OrganizationID = ""

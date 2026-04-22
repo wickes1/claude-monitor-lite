@@ -6,10 +6,9 @@ A lightweight menu bar monitor that displays **real-time rate limits** from your
 
 ## Features
 
-- Displays 5-hour session, weekly (all models), and weekly (Opus) usage limits
+- Displays 5-hour session, weekly (all models), and per-model (Sonnet, Opus, Cowork, Design) usage limits
 - Traffic light indicator: 🟢 Green (0-49%), 🟡 Yellow (50-79%), 🔴 Red (80%+)
 - Auto-refresh every 30 seconds
-- **Auto-renew:** Schedule automatic session activation at specific times
 - Requires Claude account
 
 **Platform:** Tested on macOS. Other platforms not tested.
@@ -44,7 +43,7 @@ claude-monitor-lite
 
 ![Terminal Output](demo-terminal.png)
 
-**Switching metrics:** Click the menu bar icon to choose between 5-Hour Session, Weekly (All), or Weekly (Opus).
+**Switching metrics:** Click the menu bar icon to choose between 5-Hour Session, Weekly (All), Weekly (Sonnet), Weekly (Opus), Weekly (Cowork), or Weekly (Design).
 
 ## Commands
 
@@ -52,41 +51,8 @@ claude-monitor-lite
 claude-monitor-lite              # Start or show status
 claude-monitor-lite stop         # Stop the monitor
 claude-monitor-lite logout       # Clear session
-claude-monitor-lite renew <cmd>  # Auto-renew management
+claude-monitor-lite version      # Show version
 ```
-
-## Auto-Renew
-
-Schedule automatic session activation to maximize your 5-hour usage windows.
-
-**Requires:** [Claude Code](https://code.claude.com/docs) CLI installed.
-
-```bash
-# Set daily trigger times
-claude-monitor-lite renew --schedule 09:00,14:00
-
-# Set activation message (default: "hello")
-claude-monitor-lite renew --message "hi"
-
-# Enable/disable
-claude-monitor-lite renew on
-claude-monitor-lite renew off
-
-# Check status
-claude-monitor-lite renew status
-
-# Trigger immediately
-claude-monitor-lite renew now
-
-# View recent events
-claude-monitor-lite renew log
-```
-
-**How it works:** At scheduled times, the daemon sends a message to Claude CLI (`claude -p "hello"`) to activate a new 5-hour session window. This ensures your usage windows align with your work schedule.
-
-**Retry behavior:**
-- Triggers within 1.5-minute window (~3 retries at 30s intervals)
-- Only records successful activations (failed attempts don't block next day)
 
 ## Troubleshooting
 

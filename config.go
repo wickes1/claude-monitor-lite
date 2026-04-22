@@ -16,20 +16,6 @@ type Config struct {
 	OrganizationID   string     `json:"organizationId,omitempty"`
 	SavedAt          *time.Time `json:"savedAt,omitempty"`
 	MenuBarIndicator string     `json:"menuBarIndicator"`
-	AutoRenew        AutoRenew  `json:"autoRenew,omitempty"`
-}
-
-type AutoRenew struct {
-	Enabled    bool                      `json:"enabled"`
-	Schedule   []string                  `json:"schedule"`   // e.g., ["09:00", "14:00"]
-	Message    string                    `json:"message"`    // e.g., "hello"
-	LastSent   map[string]string         `json:"lastSent"`   // e.g., {"09:00": "2025-01-28"}
-	LastFailed map[string]*FailedAttempt `json:"lastFailed"` // e.g., {"09:00": {"date": "2025-01-28", "error": "..."}}
-}
-
-type FailedAttempt struct {
-	Date  string `json:"date"`
-	Error string `json:"error"`
 }
 
 func GetConfigPath() string {
@@ -85,36 +71,3 @@ func SaveConfigPreservingSession(menuBarIndicator string) error {
 	})
 }
 
-// SaveAutoRenewConfig updates only autoRenew settings, preserving other fields
-func SaveAutoRenewConfig(autoRenew AutoRenew) error {
-	return modifyAndSaveConfig(func(c *Config) {
-		c.AutoRenew = autoRenew
-	})
-}
-
-// UpdateAutoRenewLastSent updates only the lastSent map for auto-renew
-func UpdateAutoRenewLastSent(scheduleTime, date string) error {
-	return modifyAndSaveConfig(func(c *Config) {
-		if c.AutoRenew.LastSent == nil {
-			c.AutoRenew.LastSent = make(map[string]string)
-		}
-		c.AutoRenew.LastSent[scheduleTime] = date
-		// Clear any previous failure for this schedule time on success
-		if c.AutoRenew.LastFailed != nil {
-			delete(c.AutoRenew.LastFailed, scheduleTime)
-		}
-	})
-}
-
-// UpdateAutoRenewLastFailed records a failed auto-renew attempt
-func UpdateAutoRenewLastFailed(scheduleTime, date, errMsg string) error {
-	return modifyAndSaveConfig(func(c *Config) {
-		if c.AutoRenew.LastFailed == nil {
-			c.AutoRenew.LastFailed = make(map[string]*FailedAttempt)
-		}
-		c.AutoRenew.LastFailed[scheduleTime] = &FailedAttempt{
-			Date:  date,
-			Error: errMsg,
-		}
-	})
-}
