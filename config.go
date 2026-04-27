@@ -36,7 +36,10 @@ func LoadConfig() Config {
 		return defaultConfig
 	}
 
-	if config.MenuBarIndicator == "" {
+	switch config.MenuBarIndicator {
+	case "currentSession", "weeklyAll", "weeklySonnet", "weeklyDesign":
+		// valid
+	default:
 		config.MenuBarIndicator = "currentSession"
 	}
 
@@ -70,4 +73,3 @@ func SaveConfigPreservingSession(menuBarIndicator string) error {
 		c.MenuBarIndicator = menuBarIndicator
 	})
 }
-

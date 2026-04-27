@@ -28,12 +28,10 @@ var version = "dev"
 
 var (
 	// Menu items (also serve as indicator selectors)
-	mCurrentSession  *systray.MenuItem
-	mWeeklyAll       *systray.MenuItem
-	mWeeklySonnet    *systray.MenuItem
-	mWeeklyOpus      *systray.MenuItem
-	mWeeklyCowork    *systray.MenuItem
-	mWeeklyDesign    *systray.MenuItem
+	mCurrentSession *systray.MenuItem
+	mWeeklyAll      *systray.MenuItem
+	mWeeklySonnet   *systray.MenuItem
+	mWeeklyDesign   *systray.MenuItem
 
 	// Refresh button
 	mRefresh *systray.MenuItem
@@ -176,10 +174,6 @@ func getSelectedLimit(limits *UsageLimits, indicator string) *UsageLimit {
 		return limits.SevenDay
 	case "weeklySonnet":
 		return limits.SevenDaySonnet
-	case "weeklyOpus":
-		return limits.SevenDayOpus
-	case "weeklyCowork":
-		return limits.SevenDayCowork
 	case "weeklyDesign":
 		return limits.SevenDayOmelette
 	default:
@@ -193,12 +187,6 @@ func displayUsageStats(limits *UsageLimits) {
 	fmt.Print(formatConsoleUsage(limits.FiveHour, "5-Hour Session:", "no active session"))
 	fmt.Print(formatConsoleUsage(limits.SevenDay, "Weekly (All):", ""))
 	fmt.Print(formatConsoleUsage(limits.SevenDaySonnet, "Weekly (Sonnet):", ""))
-	if limits.SevenDayOpus != nil {
-		fmt.Print(formatConsoleUsage(limits.SevenDayOpus, "Weekly (Opus):", ""))
-	}
-	if limits.SevenDayCowork != nil {
-		fmt.Print(formatConsoleUsage(limits.SevenDayCowork, "Weekly (Cowork):", ""))
-	}
 	if limits.SevenDayOmelette != nil {
 		fmt.Print(formatConsoleUsage(limits.SevenDayOmelette, "Weekly (Design):", ""))
 	}
@@ -368,12 +356,10 @@ func handleStatusDisplay() {
 
 	// Show which indicator is displayed in menu bar
 	indicatorNames := map[string]string{
-		"currentSession":  "5-Hour Session",
-		"weeklyAll":       "Weekly (All)",
-		"weeklySonnet":    "Weekly (Sonnet)",
-		"weeklyOpus":      "Weekly (Opus)",
-		"weeklyCowork":    "Weekly (Cowork)",
-		"weeklyDesign":  "Weekly (Design)",
+		"currentSession": "5-Hour Session",
+		"weeklyAll":      "Weekly (All)",
+		"weeklySonnet":   "Weekly (Sonnet)",
+		"weeklyDesign":   "Weekly (Design)",
 	}
 
 	indicatorName := indicatorNames[appConfig.MenuBarIndicator]
@@ -553,8 +539,6 @@ func onReady() {
 	mCurrentSession = systray.AddMenuItem("5-Hour Session: --", "Click to show in menu bar")
 	mWeeklyAll = systray.AddMenuItem("Weekly (All): --", "Click to show in menu bar")
 	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
-	mWeeklyOpus = systray.AddMenuItem("Weekly (Opus): --", "Click to show in menu bar")
-	mWeeklyCowork = systray.AddMenuItem("Weekly (Cowork): --", "Click to show in menu bar")
 	mWeeklyDesign = systray.AddMenuItem("Weekly (Design): --", "Click to show in menu bar")
 	systray.AddSeparator()
 
@@ -625,36 +609,16 @@ func onReady() {
 					updateMenuBarDisplay(cached)
 				}
 				go SaveConfigPreservingSession("weeklySonnet")
-		case <-mWeeklyOpus.ClickedCh:
-			appConfig.MenuBarIndicator = "weeklyOpus"
-			updateMenuCheckmarks()
-			limitsMutex.RLock()
-			cached := lastLimits
-			limitsMutex.RUnlock()
-			if cached != nil {
-				updateMenuBarDisplay(cached)
-			}
-			go SaveConfigPreservingSession("weeklyOpus")
-		case <-mWeeklyCowork.ClickedCh:
-			appConfig.MenuBarIndicator = "weeklyCowork"
-			updateMenuCheckmarks()
-			limitsMutex.RLock()
-			cached := lastLimits
-			limitsMutex.RUnlock()
-			if cached != nil {
-				updateMenuBarDisplay(cached)
-			}
-			go SaveConfigPreservingSession("weeklyCowork")
-		case <-mWeeklyDesign.ClickedCh:
-			appConfig.MenuBarIndicator = "weeklyDesign"
-			updateMenuCheckmarks()
-			limitsMutex.RLock()
-			cached := lastLimits
-			limitsMutex.RUnlock()
-			if cached != nil {
-				updateMenuBarDisplay(cached)
-			}
-			go SaveConfigPreservingSession("weeklyDesign")
+			case <-mWeeklyDesign.ClickedCh:
+				appConfig.MenuBarIndicator = "weeklyDesign"
+				updateMenuCheckmarks()
+				limitsMutex.RLock()
+				cached := lastLimits
+				limitsMutex.RUnlock()
+				if cached != nil {
+					updateMenuBarDisplay(cached)
+				}
+				go SaveConfigPreservingSession("weeklyDesign")
 			}
 		}
 	}()
@@ -664,8 +628,6 @@ func updateMenuCheckmarks() {
 	mCurrentSession.Uncheck()
 	mWeeklyAll.Uncheck()
 	mWeeklySonnet.Uncheck()
-	mWeeklyOpus.Uncheck()
-	mWeeklyCowork.Uncheck()
 	mWeeklyDesign.Uncheck()
 
 	switch appConfig.MenuBarIndicator {
@@ -675,17 +637,12 @@ func updateMenuCheckmarks() {
 		mWeeklyAll.Check()
 	case "weeklySonnet":
 		mWeeklySonnet.Check()
-	case "weeklyOpus":
-		mWeeklyOpus.Check()
-	case "weeklyCowork":
-		mWeeklyCowork.Check()
 	case "weeklyDesign":
 		mWeeklyDesign.Check()
 	default:
 		mCurrentSession.Check()
 	}
 }
-
 
 // maxTransientErrors is the number of consecutive transient failures tolerated
 // before showing an error in the menu bar. At 30s intervals, 3 = ~1.5 minutes.
@@ -733,8 +690,6 @@ func updateStats() {
 	mCurrentSession.SetTitle(formatUsageWithReset(limits.FiveHour, "5-Hour Session:"))
 	mWeeklyAll.SetTitle(formatUsageWithReset(limits.SevenDay, "Weekly (All):"))
 	mWeeklySonnet.SetTitle(formatUsageWithReset(limits.SevenDaySonnet, "Weekly (Sonnet):"))
-	mWeeklyOpus.SetTitle(formatUsageWithReset(limits.SevenDayOpus, "Weekly (Opus):"))
-	mWeeklyCowork.SetTitle(formatUsageWithReset(limits.SevenDayCowork, "Weekly (Cowork):"))
 	mWeeklyDesign.SetTitle(formatUsageWithReset(limits.SevenDayOmelette, "Weekly (Design):"))
 
 	// Store limits for instant display switching (thread-safe)

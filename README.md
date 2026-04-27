@@ -6,7 +6,7 @@ A lightweight menu bar monitor that displays **real-time rate limits** from your
 
 ## Features
 
-- Displays 5-hour session, weekly (all models), and per-model (Sonnet, Opus, Cowork, Design) usage limits
+- Displays 5-hour session, weekly (all models), and per-model (Sonnet, Design) usage limits
 - Traffic light indicator: 🟢 Green (0-49%), 🟡 Yellow (50-79%), 🔴 Red (80%+)
 - Auto-refresh every 30 seconds
 - Requires Claude account
@@ -43,7 +43,7 @@ claude-monitor-lite
 
 ![Terminal Output](demo-terminal.png)
 
-**Switching metrics:** Click the menu bar icon to choose between 5-Hour Session, Weekly (All), Weekly (Sonnet), Weekly (Opus), Weekly (Cowork), or Weekly (Design).
+**Switching metrics:** Click the menu bar icon to choose between 5-Hour Session, Weekly (All), Weekly (Sonnet), or Weekly (Design).
 
 ## Commands
 
