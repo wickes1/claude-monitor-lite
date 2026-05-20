@@ -37,6 +37,7 @@ type ClaudeUsageClient struct {
 	sessionKey     string
 	httpClient     *http.Client
 	organizationID string
+	baseURL        string
 }
 
 // UsageLimits represents the real-time usage data from Claude
@@ -75,6 +76,7 @@ func NewClaudeUsageClient(sessionKey string) *ClaudeUsageClient {
 	client := &ClaudeUsageClient{
 		sessionKey: sessionKey,
 		httpClient: sharedHTTPClient,
+		baseURL:    claudeAPIBaseURL,
 	}
 	client.seedCookieJar()
 	return client
@@ -85,6 +87,7 @@ func NewClaudeUsageClientWithOrg(sessionKey, organizationID string) *ClaudeUsage
 		sessionKey:     sessionKey,
 		organizationID: organizationID,
 		httpClient:     sharedHTTPClient,
+		baseURL:        claudeAPIBaseURL,
 	}
 	client.seedCookieJar()
 	return client
@@ -133,9 +136,9 @@ func (c *ClaudeUsageClient) doAPIRequest(ctx context.Context, apiURL string) (*h
 // isTransientStatus returns true for HTTP status codes that indicate a
 // temporary problem (server error, rate limit, Cloudflare challenge).
 func isTransientStatus(code int) bool {
-	return code == http.StatusTooManyRequests ||
-		code >= 500 ||
-		code == http.StatusServiceUnavailable
+	return code == http.StatusRequestTimeout || // 408
+		code == http.StatusTooManyRequests || // 429
+		code >= 500
 }
 
 // GetUsageLimits fetches real-time usage limits from Claude API
@@ -148,7 +151,7 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	}
 
 	// Build the actual endpoint
-	apiURL := fmt.Sprintf("%s/organizations/%s/usage", claudeAPIBaseURL, c.organizationID)
+	apiURL := fmt.Sprintf("%s/organizations/%s/usage", c.baseURL, c.organizationID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
@@ -195,7 +198,11 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 
 	var limits UsageLimits
 	if err := json.Unmarshal(body, &limits); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		// A 200 response with a non-JSON body is almost always a Cloudflare
+		// interstitial ("Just a moment...") or a truncated/empty body from a
+		// network hiccup. Treat it as transient so the menu bar tolerates it
+		// instead of immediately flashing "Error".
+		return nil, fmt.Errorf("%w: failed to parse response: %v", ErrTransient, err)
 	}
 
 	// Parse reset times (use RFC3339Nano to handle fractional seconds)
@@ -216,26 +223,34 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 
 // fetchOrganizationID retrieves the organization ID from the account endpoint
 func (c *ClaudeUsageClient) fetchOrganizationID() error {
-	apiURL := fmt.Sprintf("%s/organizations", claudeAPIBaseURL)
+	apiURL := fmt.Sprintf("%s/organizations", c.baseURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
 	resp, err := c.doAPIRequest(ctx, apiURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrTransient, err)
 	}
 	defer resp.Body.Close()
 
 	c.refreshSessionFromJar()
 
+	// A 401 here means the session genuinely expired.
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w (status 401 fetching organizations)", ErrAuthFailed)
+	}
+
+	// Any other non-200 (5xx, 429, Cloudflare challenge, etc.) is treated as
+	// transient so a brief hiccup does not flash "Error" on the first failure.
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to fetch organizations (status %d)", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%w: organizations endpoint status %d: %s", ErrTransient, resp.StatusCode, string(body))
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: failed to read organizations response: %v", ErrTransient, err)
 	}
 
 	// Helper to extract org ID from map

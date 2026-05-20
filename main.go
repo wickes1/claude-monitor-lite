@@ -21,6 +21,7 @@ const (
 	refreshInterval    = 30 * time.Second
 	pidCheckTimeout    = 500 * time.Millisecond
 	pidFilePermissions = 0644 // Owner read/write, others read
+	logFilePermissions = 0644 // Owner read/write, others read
 )
 
 // version is set via ldflags at build time (e.g., -X main.version=v1.0.0)
@@ -387,6 +388,9 @@ func handleStart() {
 
 	daemonize()
 
+	// We are now the detached daemon child — route logs to a file.
+	setupDaemonLogging()
+
 	if err := createPIDFile(); err != nil {
 		log.Fatal("Failed to create PID file:", err)
 	}
@@ -499,6 +503,24 @@ func isRunning() bool {
 
 func createPIDFile() error {
 	return os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), pidFilePermissions)
+}
+
+// setupDaemonLogging routes the daemon's log output to a file. The daemon runs
+// detached with no terminal attached, so otherwise every log line (transient
+// errors, fetch failures) is discarded and the process cannot be diagnosed
+// after the fact. Logs go to ~/.claude-monitor-lite.log.
+func setupDaemonLogging() {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	logPath := filepath.Join(homeDir, ".claude-monitor-lite.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
+	if err != nil {
+		return
+	}
+	log.SetOutput(f)
+	log.Printf("claude-monitor-lite %s started (pid %d)", version, os.Getpid())
 }
 
 func cleanup() {
