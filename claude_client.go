@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -111,9 +112,11 @@ func (c *ClaudeUsageClient) refreshSessionFromJar() {
 			c.sessionKey = cookie.Value
 			// Persist the refreshed key to config in background
 			go func(newKey string) {
-				modifyAndSaveConfig(func(cfg *Config) {
+				if err := modifyAndSaveConfig(func(cfg *Config) {
 					cfg.SessionKey = newKey
-				})
+				}); err != nil {
+					log.Printf("Failed to persist refreshed session key: %v", err)
+				}
 			}(cookie.Value)
 			return
 		}

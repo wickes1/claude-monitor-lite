@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,7 +22,7 @@ const (
 	refreshInterval    = 30 * time.Second
 	pidCheckTimeout    = 500 * time.Millisecond
 	pidFilePermissions = 0644 // Owner read/write, others read
-	logFilePermissions = 0644 // Owner read/write, others read
+	logFilePermissions = 0600 // Owner read/write only (may contain error bodies)
 )
 
 // version is set via ldflags at build time (e.g., -X main.version=v1.0.0)
@@ -42,6 +43,10 @@ var (
 	pidFile      string
 	claudeClient *ClaudeUsageClient
 
+	// Guards appConfig.MenuBarIndicator — written by menu clicks (event loop),
+	// read by the update worker.
+	indicatorMutex sync.RWMutex
+
 	// Last fetched limits for instant display switching (protected by mutex)
 	lastLimits  *UsageLimits
 	limitsMutex sync.RWMutex
@@ -61,6 +66,20 @@ func createClientFromSession(session *AuthSession) *ClaudeUsageClient {
 		return NewClaudeUsageClientWithOrg(session.SessionKey, session.OrganizationID)
 	}
 	return NewClaudeUsageClient(session.SessionKey)
+}
+
+// getMenuBarIndicator and setMenuBarIndicator guard appConfig.MenuBarIndicator,
+// which is written by menu clicks (event loop) and read by the update worker.
+func getMenuBarIndicator() string {
+	indicatorMutex.RLock()
+	defer indicatorMutex.RUnlock()
+	return appConfig.MenuBarIndicator
+}
+
+func setMenuBarIndicator(indicator string) {
+	indicatorMutex.Lock()
+	appConfig.MenuBarIndicator = indicator
+	indicatorMutex.Unlock()
 }
 
 // Helper function to round utilization to nearest integer
@@ -100,7 +119,7 @@ func calculateTimeUntilReset(resetTime time.Time) (hours, minutes int, valid boo
 		return 0, 0, false
 	}
 
-	// Convert to total minutes (no rounding - show exact time remaining)
+	// Whole minutes remaining, truncated to the minute
 	totalMinutes := int(duration.Minutes())
 
 	return totalMinutes / 60, totalMinutes % 60, true
@@ -196,7 +215,7 @@ func displayUsageStats(limits *UsageLimits) {
 
 // Helper function to update menu bar display
 func updateMenuBarDisplay(limits *UsageLimits) {
-	limit := getSelectedLimit(limits, appConfig.MenuBarIndicator)
+	limit := getSelectedLimit(limits, getMenuBarIndicator())
 
 	if limit == nil {
 		systray.SetTitle("⚪ --")
@@ -297,6 +316,30 @@ func handleAutoStart() {
 	handleStart()
 }
 
+// loginValidationAttempts and loginRetryDelay control how hard the login flow
+// tries to validate a freshly entered key before giving up.
+const (
+	loginValidationAttempts = 3
+	loginRetryDelay         = 1 * time.Second
+)
+
+// validateSession checks that a session key works, retrying on transient
+// failures (Cloudflare interstitials, network blips) so a momentary hiccup
+// does not reject a valid key. A real auth failure returns immediately.
+func validateSession(client *ClaudeUsageClient, attempts int, delay time.Duration) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = client.TestSession()
+		if err == nil || errors.Is(err, ErrSessionExpired) {
+			return err
+		}
+		if attempt < attempts {
+			time.Sleep(delay)
+		}
+	}
+	return err
+}
+
 func handleLoginFlow() (*AuthSession, error) {
 	session, err := LoginWithBrowser()
 	if err != nil {
@@ -306,7 +349,7 @@ func handleLoginFlow() (*AuthSession, error) {
 
 	// Test the session and fetch organization ID
 	client := NewClaudeUsageClient(session.SessionKey)
-	if err := client.TestSession(); err != nil {
+	if err := validateSession(client, loginValidationAttempts, loginRetryDelay); err != nil {
 		fmt.Fprintf(os.Stderr, "Session validation failed: %v\n", err)
 		fmt.Println("The session key may be invalid. Please try again.")
 		return nil, err
@@ -333,8 +376,7 @@ func handleLoginFlow() (*AuthSession, error) {
 }
 
 func handleStatusDisplay() {
-	data, _ := os.ReadFile(pidFile)
-	pid, _ := strconv.Atoi(string(data))
+	pid, _ := readValidPID()
 	fmt.Printf("✓ Already running (PID: %d)\n", pid)
 	fmt.Println()
 
@@ -363,12 +405,13 @@ func handleStatusDisplay() {
 		"weeklyDesign":   "Weekly (Design)",
 	}
 
-	indicatorName := indicatorNames[appConfig.MenuBarIndicator]
+	indicator := getMenuBarIndicator()
+	indicatorName := indicatorNames[indicator]
 	if indicatorName == "" {
 		indicatorName = "5-Hour Session"
 	}
 
-	limit := getSelectedLimit(limits, appConfig.MenuBarIndicator)
+	limit := getSelectedLimit(limits, indicator)
 	utilization := 0.0
 	if limit != nil {
 		utilization = limit.Utilization
@@ -407,29 +450,14 @@ func handleStart() {
 }
 
 func handleStop() {
-	if !isRunning() {
+	pid, ok := readValidPID()
+	if !ok {
 		fmt.Println("Claude Monitor Lite is not running.")
 		os.Exit(0)
 	}
 
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read PID file: %v\n", err)
-		os.Exit(1)
-	}
-
-	pid, err := strconv.Atoi(string(data))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid PID: %v\n", err)
-		os.Exit(1)
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to find process: %v\n", err)
-		os.Exit(1)
-	}
-
+	// readValidPID already confirmed this PID is our process.
+	process, _ := os.FindProcess(pid) // never errors on Unix
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to stop process: %v\n", err)
 		os.Exit(1)
@@ -444,19 +472,11 @@ func handleStop() {
 
 func handleLogout() {
 	// Stop daemon if running
-	if isRunning() {
+	if pid, ok := readValidPID(); ok {
 		fmt.Println("Stopping monitor...")
-		data, err := os.ReadFile(pidFile)
-		if err == nil {
-			pid, err := strconv.Atoi(string(data))
-			if err == nil {
-				process, err := os.FindProcess(pid)
-				if err == nil {
-					process.Signal(syscall.SIGTERM)
-					time.Sleep(pidCheckTimeout)
-				}
-			}
-		}
+		process, _ := os.FindProcess(pid) // never errors on Unix
+		process.Signal(syscall.SIGTERM)
+		time.Sleep(pidCheckTimeout)
 		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to remove PID file: %v\n", err)
 		}
@@ -470,39 +490,54 @@ func handleLogout() {
 	fmt.Println("✓ Logged out! Session data cleared.")
 }
 
-func isRunning() bool {
-	data, err := os.ReadFile(pidFile)
+// isOurProcess reports whether pid belongs to a live claude-monitor-lite
+// process. os.FindProcess never fails on Unix and PIDs are recycled, so a
+// bare liveness check (Signal 0) can return a false positive for an unrelated
+// process that inherited the PID; checking the command name guards against that.
+func isOurProcess(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	// `ps` exits non-zero if the PID does not exist.
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err != nil {
 		return false
 	}
-
-	pid, err := strconv.Atoi(string(data))
-	if err != nil {
-		// Invalid PID file, clean it up
-		os.Remove(pidFile)
-		return false
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		// Process doesn't exist, clean up stale PID file
-		os.Remove(pidFile)
-		return false
-	}
-
-	// Send signal 0 to check if process is alive
-	err = process.Signal(syscall.Signal(0))
-	if err != nil {
-		// Process is dead, clean up stale PID file
-		os.Remove(pidFile)
-		return false
-	}
-
-	return true
+	return strings.Contains(string(out), "claude-monitor-lite")
 }
 
+// readValidPID returns the PID from the PID file only if it belongs to a live
+// claude-monitor-lite process. A stale or recycled-PID file is removed and
+// (0, false) returned.
+func readValidPID() (int, bool) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || !isOurProcess(pid) {
+		os.Remove(pidFile)
+		return 0, false
+	}
+	return pid, true
+}
+
+func isRunning() bool {
+	_, ok := readValidPID()
+	return ok
+}
+
+// createPIDFile writes the daemon PID file. O_EXCL makes creation fail if the
+// file already exists, so two daemons racing to start cannot both claim
+// ownership (callers clear stale PID files via readValidPID before reaching here).
 func createPIDFile() error {
-	return os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), pidFilePermissions)
+	f, err := os.OpenFile(pidFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, pidFilePermissions)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(strconv.Itoa(os.Getpid()))
+	return err
 }
 
 // setupDaemonLogging routes the daemon's log output to a file. The daemon runs
@@ -520,6 +555,11 @@ func setupDaemonLogging() {
 		return
 	}
 	log.SetOutput(f)
+	// O_CREATE only sets permissions for a newly created file; enforce them on
+	// a pre-existing log file too.
+	if err := f.Chmod(logFilePermissions); err != nil {
+		log.Printf("Warning: could not restrict log file permissions: %v", err)
+	}
 	log.Printf("claude-monitor-lite %s started (pid %d)", version, os.Getpid())
 }
 
@@ -572,78 +612,73 @@ func onReady() {
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
 	updateMenuCheckmarks()
-	go updateStats()
 
+	// A single worker owns all usage fetching, so updateStats never runs
+	// concurrently with itself.
+	go runUpdateWorker(appCtx)
+
+	// Event loop — handles menu interaction only.
 	go func() {
-		ticker := time.NewTicker(refreshInterval)
-		defer ticker.Stop()
-
 		for {
 			select {
 			case <-appCtx.Done():
 				return
-			case <-ticker.C:
-				go updateStats()
 			case <-mQuit.ClickedCh:
 				appCancel()
 				systray.Quit()
 				return
 			case <-mRefresh.ClickedCh:
-				go updateStats()
+				requestRefresh()
 			case <-mOpenConfig.ClickedCh:
-				go func() {
-					homeDir, _ := os.UserHomeDir()
-					configPath := filepath.Join(homeDir, ".claude-monitor-lite.json")
-					exec.Command("open", configPath).Start()
-				}()
+				go openConfigFile()
 			case <-mAbout.ClickedCh:
-				go func() {
-					exec.Command("osascript", "-e",
-						fmt.Sprintf(`display dialog "Claude Monitor Lite\nVersion: %s" buttons {"OK"} default button "OK" with title "About"`, version)).Start()
-				}()
+				go showAboutDialog()
 			case <-mCurrentSession.ClickedCh:
-				appConfig.MenuBarIndicator = "currentSession"
-				updateMenuCheckmarks()
-				limitsMutex.RLock()
-				cached := lastLimits
-				limitsMutex.RUnlock()
-				if cached != nil {
-					updateMenuBarDisplay(cached)
-				}
-				go SaveConfigPreservingSession("currentSession")
+				selectIndicator("currentSession")
 			case <-mWeeklyAll.ClickedCh:
-				appConfig.MenuBarIndicator = "weeklyAll"
-				updateMenuCheckmarks()
-				limitsMutex.RLock()
-				cached := lastLimits
-				limitsMutex.RUnlock()
-				if cached != nil {
-					updateMenuBarDisplay(cached)
-				}
-				go SaveConfigPreservingSession("weeklyAll")
+				selectIndicator("weeklyAll")
 			case <-mWeeklySonnet.ClickedCh:
-				appConfig.MenuBarIndicator = "weeklySonnet"
-				updateMenuCheckmarks()
-				limitsMutex.RLock()
-				cached := lastLimits
-				limitsMutex.RUnlock()
-				if cached != nil {
-					updateMenuBarDisplay(cached)
-				}
-				go SaveConfigPreservingSession("weeklySonnet")
+				selectIndicator("weeklySonnet")
 			case <-mWeeklyDesign.ClickedCh:
-				appConfig.MenuBarIndicator = "weeklyDesign"
-				updateMenuCheckmarks()
-				limitsMutex.RLock()
-				cached := lastLimits
-				limitsMutex.RUnlock()
-				if cached != nil {
-					updateMenuBarDisplay(cached)
-				}
-				go SaveConfigPreservingSession("weeklyDesign")
+				selectIndicator("weeklyDesign")
 			}
 		}
 	}()
+}
+
+// selectIndicator switches which usage metric the menu bar shows, updating the
+// display immediately from cached data so the click feels instant.
+func selectIndicator(indicator string) {
+	setMenuBarIndicator(indicator)
+	updateMenuCheckmarks()
+
+	limitsMutex.RLock()
+	cached := lastLimits
+	limitsMutex.RUnlock()
+	if cached != nil {
+		updateMenuBarDisplay(cached)
+	}
+
+	go func() {
+		if err := SaveConfigPreservingSession(indicator); err != nil {
+			log.Printf("Failed to save menu bar indicator: %v", err)
+		}
+	}()
+}
+
+// openConfigFile opens the config file in the user's default editor.
+func openConfigFile() {
+	if err := exec.Command("open", GetConfigPath()).Start(); err != nil {
+		log.Printf("Failed to open config file: %v", err)
+	}
+}
+
+// showAboutDialog shows a small version dialog.
+func showAboutDialog() {
+	script := fmt.Sprintf(`display dialog "Claude Monitor Lite\nVersion: %s" buttons {"OK"} default button "OK" with title "About"`, version)
+	if err := exec.Command("osascript", "-e", script).Start(); err != nil {
+		log.Printf("Failed to show about dialog: %v", err)
+	}
 }
 
 func updateMenuCheckmarks() {
@@ -670,6 +705,58 @@ func updateMenuCheckmarks() {
 // before showing an error in the menu bar. At 30s intervals, 3 = ~1.5 minutes.
 const maxTransientErrors = 3
 
+// updateAction is how the menu bar should react to a failed usage fetch.
+type updateAction int
+
+const (
+	actionShowError updateAction = iota // show the error state
+	actionShowAuth                      // show "Login" — session expired
+	actionKeepStale                     // tolerate a transient blip, keep last good data
+)
+
+// classifyUpdate decides how the menu bar should react to a failed usage fetch,
+// given the error and how many consecutive failures have occurred.
+func classifyUpdate(err error, consecutiveCount int) updateAction {
+	if errors.Is(err, ErrAuthFailed) {
+		return actionShowAuth
+	}
+	if errors.Is(err, ErrTransient) && consecutiveCount <= maxTransientErrors {
+		return actionKeepStale
+	}
+	return actionShowError
+}
+
+// refreshTrigger asks the update worker to fetch now. Sends coalesce, so rapid
+// refresh requests do not pile up.
+var refreshTrigger = make(chan struct{}, 1)
+
+func requestRefresh() {
+	select {
+	case refreshTrigger <- struct{}{}:
+	default:
+	}
+}
+
+// runUpdateWorker is the single goroutine that fetches usage data — on a timer
+// and on demand. Confining fetches to one goroutine means updateStats never
+// runs concurrently with itself.
+func runUpdateWorker(ctx context.Context) {
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
+
+	updateStats() // initial fetch
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			updateStats()
+		case <-refreshTrigger:
+			updateStats()
+		}
+	}
+}
+
 func updateStats() {
 	if claudeClient == nil {
 		systray.SetTitle("⚪ Error")
@@ -683,23 +770,17 @@ func updateStats() {
 		count := consecutiveErrors
 		consecutiveMutex.Unlock()
 
-		// Real auth failure — show immediately
-		if errors.Is(err, ErrAuthFailed) {
+		switch classifyUpdate(err, count) {
+		case actionShowAuth:
 			mCurrentSession.SetTitle("Session expired - please login again")
 			systray.SetTitle("⚪ Login")
-			return
-		}
-
-		// Transient error — keep showing last good data if within tolerance
-		if errors.Is(err, ErrTransient) && count <= maxTransientErrors {
+		case actionKeepStale:
 			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
-			return // keep current display unchanged
+		case actionShowError:
+			log.Printf("Error fetching usage: %v", err)
+			systray.SetTitle("⚪ Error")
+			mCurrentSession.SetTitle("Error loading data")
 		}
-
-		// Exceeded tolerance or unknown error — show error state
-		log.Printf("Error fetching usage: %v", err)
-		systray.SetTitle("⚪ Error")
-		mCurrentSession.SetTitle("Error loading data")
 		return
 	}
 
