@@ -47,10 +47,8 @@ func loadConfigFrom(path string) Config {
 		return defaultConfig
 	}
 
-	switch config.MenuBarIndicator {
-	case "currentSession", "weeklyAll", "weeklySonnet", "weeklyDesign":
-		// valid
-	default:
+	// Fall back to the default for an unknown or stale indicator key.
+	if !isValidIndicator(config.MenuBarIndicator) {
 		config.MenuBarIndicator = "currentSession"
 	}
 

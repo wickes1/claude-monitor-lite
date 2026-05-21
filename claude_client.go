@@ -41,19 +41,39 @@ type ClaudeUsageClient struct {
 	baseURL        string
 }
 
-// UsageLimits represents the real-time usage data from Claude
-// Based on actual API response from claude.ai/api/organizations/{org_id}/usage
+// UsageLimits mirrors the claude.ai/api/organizations/{org_id}/usage response.
+// Every field the endpoint returns is represented here in API response order so
+// the response is captured in full; windows the account does not use arrive as
+// null and unmarshal to nil pointers.
 type UsageLimits struct {
-	FiveHour         *UsageLimit `json:"five_hour,omitempty"`
-	SevenDay         *UsageLimit `json:"seven_day,omitempty"`
-	SevenDaySonnet   *UsageLimit `json:"seven_day_sonnet,omitempty"`
-	SevenDayOmelette *UsageLimit `json:"seven_day_omelette,omitempty"`
+	FiveHour            *UsageLimit     `json:"five_hour,omitempty"`
+	SevenDay            *UsageLimit     `json:"seven_day,omitempty"`
+	SevenDayOAuthApps   *UsageLimit     `json:"seven_day_oauth_apps,omitempty"`
+	SevenDayOpus        *UsageLimit     `json:"seven_day_opus,omitempty"`
+	SevenDaySonnet      *UsageLimit     `json:"seven_day_sonnet,omitempty"`
+	SevenDayCowork      *UsageLimit     `json:"seven_day_cowork,omitempty"`
+	SevenDayOmelette    *UsageLimit     `json:"seven_day_omelette,omitempty"`
+	Tangelo             *UsageLimit     `json:"tangelo,omitempty"`
+	IguanaNecktie       *UsageLimit     `json:"iguana_necktie,omitempty"`
+	OmelettePromotional *UsageLimit     `json:"omelette_promotional,omitempty"`
+	ExtraUsage          *ExtraUsageInfo `json:"extra_usage,omitempty"`
 }
 
 type UsageLimit struct {
 	Utilization  float64   `json:"utilization"`
 	ResetsAt     *string   `json:"resets_at"`
 	ResetsAtTime time.Time `json:"-"`
+}
+
+// ExtraUsageInfo mirrors the extra_usage object — pay-as-you-go credit state.
+// All fields except IsEnabled are null until pay-as-you-go is turned on.
+type ExtraUsageInfo struct {
+	IsEnabled      bool     `json:"is_enabled"`
+	MonthlyLimit   *float64 `json:"monthly_limit"`
+	UsedCredits    *float64 `json:"used_credits"`
+	Utilization    *float64 `json:"utilization"`
+	Currency       *string  `json:"currency"`
+	DisabledReason *string  `json:"disabled_reason"`
 }
 
 func newHTTPClient() *http.Client {
@@ -218,8 +238,14 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	}
 	parseResetTime(limits.FiveHour)
 	parseResetTime(limits.SevenDay)
+	parseResetTime(limits.SevenDayOAuthApps)
+	parseResetTime(limits.SevenDayOpus)
 	parseResetTime(limits.SevenDaySonnet)
+	parseResetTime(limits.SevenDayCowork)
 	parseResetTime(limits.SevenDayOmelette)
+	parseResetTime(limits.Tangelo)
+	parseResetTime(limits.IguanaNecktie)
+	parseResetTime(limits.OmelettePromotional)
 
 	return &limits, nil
 }

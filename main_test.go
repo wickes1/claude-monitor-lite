@@ -123,3 +123,70 @@ func TestValidateSessionGivesUpAfterAttempts(t *testing.T) {
 		t.Fatal("expected an error after exhausting retries, got nil")
 	}
 }
+
+// The indicators table is the single source of truth for menu items, config
+// validation and selection — every key must be unique and non-empty, with a
+// getter, or those layers silently break.
+func TestIndicatorsTableConsistent(t *testing.T) {
+	if len(indicators) == 0 {
+		t.Fatal("indicators table is empty")
+	}
+	seen := make(map[string]bool)
+	for _, ind := range indicators {
+		if ind.key == "" || ind.label == "" || ind.get == nil {
+			t.Errorf("indicator %q has an empty field: %+v", ind.key, ind)
+		}
+		if seen[ind.key] {
+			t.Errorf("duplicate indicator key %q", ind.key)
+		}
+		seen[ind.key] = true
+		if !isValidIndicator(ind.key) {
+			t.Errorf("isValidIndicator(%q) = false for a table entry", ind.key)
+		}
+	}
+	if isValidIndicator("bogusKey") {
+		t.Error("isValidIndicator accepted an unknown key")
+	}
+}
+
+// getSelectedLimit must route each key to the matching window and fall back to
+// the 5-hour window for an unknown key.
+func TestGetSelectedLimitRouting(t *testing.T) {
+	limits := &UsageLimits{
+		FiveHour:         &UsageLimit{Utilization: 1},
+		SevenDay:         &UsageLimit{Utilization: 2},
+		SevenDayOpus:     &UsageLimit{Utilization: 4},
+		SevenDaySonnet:   &UsageLimit{Utilization: 5},
+		SevenDayOmelette: &UsageLimit{Utilization: 7},
+	}
+	cases := map[string]float64{
+		"currentSession": 1,
+		"weeklyAll":      2,
+		"weeklyOpus":     4,
+		"weeklySonnet":   5,
+		"weeklyDesign":   7,
+		"bogusKey":       1, // unknown -> default five_hour
+	}
+	for key, want := range cases {
+		got := getSelectedLimit(limits, key)
+		if got == nil || got.Utilization != want {
+			t.Errorf("getSelectedLimit(%q) = %+v, want utilization %v", key, got, want)
+		}
+	}
+}
+
+// extra_usage only adapts to a window once pay-as-you-go is reporting a
+// utilization; otherwise it reports nothing (nil -> "--" in the menu).
+func TestExtraUsageWindow(t *testing.T) {
+	if extraUsageWindow(&UsageLimits{}) != nil {
+		t.Error("extraUsageWindow(no extra_usage) should be nil")
+	}
+	if extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{IsEnabled: false}}) != nil {
+		t.Error("extraUsageWindow(disabled, nil utilization) should be nil")
+	}
+	util := 25.0
+	w := extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{IsEnabled: true, Utilization: &util}})
+	if w == nil || w.Utilization != 25.0 {
+		t.Errorf("extraUsageWindow(enabled 25%%) = %+v, want utilization 25", w)
+	}
+}

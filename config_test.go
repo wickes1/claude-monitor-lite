@@ -73,7 +73,6 @@ func TestModifyAndSaveConfigConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	indicators := []string{"currentSession", "weeklyAll", "weeklySonnet", "weeklyDesign"}
 	stop := make(chan struct{})
 
 	var reader sync.WaitGroup
@@ -104,11 +103,38 @@ func TestModifyAndSaveConfigConcurrent(t *testing.T) {
 		go func(n int) {
 			defer writers.Done()
 			_ = modifyAndSaveConfigAt(path, func(c *Config) {
-				c.MenuBarIndicator = indicators[n%len(indicators)]
+				c.MenuBarIndicator = indicators[n%len(indicators)].key
 			})
 		}(i)
 	}
 	writers.Wait()
 	close(stop)
 	reader.Wait()
+}
+
+// Every key in the indicators table must survive a config save/load round-trip,
+// so a freshly added metric can actually be persisted as the selected one.
+func TestLoadConfigAcceptsAllIndicators(t *testing.T) {
+	for _, ind := range indicators {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := modifyAndSaveConfigAt(path, func(c *Config) {
+			c.MenuBarIndicator = ind.key
+		}); err != nil {
+			t.Fatalf("save %q failed: %v", ind.key, err)
+		}
+		if got := loadConfigFrom(path); got.MenuBarIndicator != ind.key {
+			t.Errorf("indicator %q not preserved, got %q", ind.key, got.MenuBarIndicator)
+		}
+	}
+}
+
+// An unknown or stale indicator key must fall back to the default on load.
+func TestLoadConfigRejectsUnknownIndicator(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"menuBarIndicator":"staleKey"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadConfigFrom(path); got.MenuBarIndicator != "currentSession" {
+		t.Errorf("stale indicator = %q, want fallback 'currentSession'", got.MenuBarIndicator)
+	}
 }

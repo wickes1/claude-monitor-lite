@@ -28,12 +28,13 @@ const (
 // version is set via ldflags at build time (e.g., -X main.version=v1.0.0)
 var version = "dev"
 
+// githubURL is the project repository, shown in (and opened from) the About dialog.
+const githubURL = "https://github.com/wickes1/claude-monitor-lite"
+
 var (
-	// Menu items (also serve as indicator selectors)
-	mCurrentSession *systray.MenuItem
-	mWeeklyAll      *systray.MenuItem
-	mWeeklySonnet   *systray.MenuItem
-	mWeeklyDesign   *systray.MenuItem
+	// indicatorMenuItems holds the systray menu items, parallel to the
+	// indicators table. Populated once in onReady.
+	indicatorMenuItems []*systray.MenuItem
 
 	// Refresh button
 	mRefresh *systray.MenuItem
@@ -60,6 +61,62 @@ var (
 	appCancel context.CancelFunc
 )
 
+// indicator is one selectable usage metric: a stable config key, a menu label,
+// and how to pull its window out of a usage response. This table is the single
+// source of truth — menu items, config validation, display and selection all
+// derive from it, so a new API field means adding exactly one row here.
+type indicator struct {
+	key   string
+	label string
+	get   func(*UsageLimits) *UsageLimit
+}
+
+// indicators lists every metric the usage API returns, in API response order.
+var indicators = []indicator{
+	{"currentSession", "5-Hour Session", func(u *UsageLimits) *UsageLimit { return u.FiveHour }},
+	{"weeklyAll", "Weekly (All)", func(u *UsageLimits) *UsageLimit { return u.SevenDay }},
+	{"weeklyOAuthApps", "Weekly (OAuth Apps)", func(u *UsageLimits) *UsageLimit { return u.SevenDayOAuthApps }},
+	{"weeklyOpus", "Weekly (Opus)", func(u *UsageLimits) *UsageLimit { return u.SevenDayOpus }},
+	{"weeklySonnet", "Weekly (Sonnet)", func(u *UsageLimits) *UsageLimit { return u.SevenDaySonnet }},
+	{"weeklyCowork", "Weekly (Cowork)", func(u *UsageLimits) *UsageLimit { return u.SevenDayCowork }},
+	{"weeklyDesign", "Weekly (Design)", func(u *UsageLimits) *UsageLimit { return u.SevenDayOmelette }},
+	{"tangelo", "Tangelo", func(u *UsageLimits) *UsageLimit { return u.Tangelo }},
+	{"iguanaNecktie", "Iguana Necktie", func(u *UsageLimits) *UsageLimit { return u.IguanaNecktie }},
+	{"designPromotional", "Design (Promotional)", func(u *UsageLimits) *UsageLimit { return u.OmelettePromotional }},
+	{"extraUsage", "Extra Usage", extraUsageWindow},
+}
+
+// extraUsageWindow adapts the pay-as-you-go extra_usage object to the window
+// shape so it can be displayed like any other metric. It has no reset time and
+// reports nothing until pay-as-you-go is enabled and reporting a utilization.
+func extraUsageWindow(u *UsageLimits) *UsageLimit {
+	if u.ExtraUsage == nil || u.ExtraUsage.Utilization == nil {
+		return nil
+	}
+	return &UsageLimit{Utilization: *u.ExtraUsage.Utilization}
+}
+
+// findIndicator returns the indicator for key, falling back to the first
+// (default) entry when key is unknown.
+func findIndicator(key string) indicator {
+	for i := range indicators {
+		if indicators[i].key == key {
+			return indicators[i]
+		}
+	}
+	return indicators[0]
+}
+
+// isValidIndicator reports whether key names a known indicator.
+func isValidIndicator(key string) bool {
+	for i := range indicators {
+		if indicators[i].key == key {
+			return true
+		}
+	}
+	return false
+}
+
 // Helper function to create Claude client from session
 func createClientFromSession(session *AuthSession) *ClaudeUsageClient {
 	if session.OrganizationID != "" {
@@ -76,9 +133,9 @@ func getMenuBarIndicator() string {
 	return appConfig.MenuBarIndicator
 }
 
-func setMenuBarIndicator(indicator string) {
+func setMenuBarIndicator(key string) {
 	indicatorMutex.Lock()
-	appConfig.MenuBarIndicator = indicator
+	appConfig.MenuBarIndicator = key
 	indicatorMutex.Unlock()
 }
 
@@ -186,29 +243,26 @@ func formatConsoleUsage(limit *UsageLimit, label string, noSessionMsg string) st
 }
 
 // Helper function to get the selected limit based on indicator setting
-func getSelectedLimit(limits *UsageLimits, indicator string) *UsageLimit {
-	switch indicator {
-	case "currentSession":
-		return limits.FiveHour
-	case "weeklyAll":
-		return limits.SevenDay
-	case "weeklySonnet":
-		return limits.SevenDaySonnet
-	case "weeklyDesign":
-		return limits.SevenDayOmelette
-	default:
-		return limits.FiveHour
-	}
+func getSelectedLimit(limits *UsageLimits, indicatorKey string) *UsageLimit {
+	return findIndicator(indicatorKey).get(limits)
 }
 
-// Helper function to display usage stats
+// Helper function to display usage stats. Windows with no data are skipped to
+// match the menu, except the 5-hour session, which is always shown as the
+// headline metric.
 func displayUsageStats(limits *UsageLimits) {
 	fmt.Println("=== Current Usage ===")
-	fmt.Print(formatConsoleUsage(limits.FiveHour, "5-Hour Session:", "no active session"))
-	fmt.Print(formatConsoleUsage(limits.SevenDay, "Weekly (All):", ""))
-	fmt.Print(formatConsoleUsage(limits.SevenDaySonnet, "Weekly (Sonnet):", ""))
-	if limits.SevenDayOmelette != nil {
-		fmt.Print(formatConsoleUsage(limits.SevenDayOmelette, "Weekly (Design):", ""))
+	for i := range indicators {
+		limit := indicators[i].get(limits)
+		isCurrentSession := indicators[i].key == "currentSession"
+		if limit == nil && !isCurrentSession {
+			continue
+		}
+		noSessionMsg := ""
+		if isCurrentSession {
+			noSessionMsg = "no active session"
+		}
+		fmt.Print(formatConsoleUsage(limit, indicators[i].label+":", noSessionMsg))
 	}
 	fmt.Println()
 }
@@ -224,12 +278,12 @@ func updateMenuBarDisplay(limits *UsageLimits) {
 
 	utilization := roundUtilization(limit.Utilization)
 	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAtTime)
-	indicator := getColorIndicator(limit.Utilization)
+	color := getColorIndicator(limit.Utilization)
 
 	if hasTime {
-		systray.SetTitle(fmt.Sprintf("%s %d%% (%dh%dm)", indicator, utilization, hours, minutes))
+		systray.SetTitle(fmt.Sprintf("%s %d%% (%dh%dm)", color, utilization, hours, minutes))
 	} else {
-		systray.SetTitle(fmt.Sprintf("%s %d%%", indicator, utilization))
+		systray.SetTitle(fmt.Sprintf("%s %d%%", color, utilization))
 	}
 }
 
@@ -398,26 +452,15 @@ func handleStatusDisplay() {
 	displayUsageStats(limits)
 
 	// Show which indicator is displayed in menu bar
-	indicatorNames := map[string]string{
-		"currentSession": "5-Hour Session",
-		"weeklyAll":      "Weekly (All)",
-		"weeklySonnet":   "Weekly (Sonnet)",
-		"weeklyDesign":   "Weekly (Design)",
-	}
+	selected := findIndicator(getMenuBarIndicator())
 
-	indicator := getMenuBarIndicator()
-	indicatorName := indicatorNames[indicator]
-	if indicatorName == "" {
-		indicatorName = "5-Hour Session"
-	}
-
-	limit := getSelectedLimit(limits, indicator)
+	limit := selected.get(limits)
 	utilization := 0.0
 	if limit != nil {
 		utilization = limit.Utilization
 	}
 
-	fmt.Printf("Menu Bar Shows:  %s (%s %d%%)\n", indicatorName, getColorIndicator(utilization), roundUtilization(utilization))
+	fmt.Printf("Menu Bar Shows:  %s (%s %d%%)\n", selected.label, getColorIndicator(utilization), roundUtilization(utilization))
 }
 
 func handleStart() {
@@ -598,10 +641,10 @@ func onReady() {
 
 	claudeClient = createClientFromSession(session)
 
-	mCurrentSession = systray.AddMenuItem("5-Hour Session: --", "Click to show in menu bar")
-	mWeeklyAll = systray.AddMenuItem("Weekly (All): --", "Click to show in menu bar")
-	mWeeklySonnet = systray.AddMenuItem("Weekly (Sonnet): --", "Click to show in menu bar")
-	mWeeklyDesign = systray.AddMenuItem("Weekly (Design): --", "Click to show in menu bar")
+	indicatorMenuItems = make([]*systray.MenuItem, len(indicators))
+	for i := range indicators {
+		indicatorMenuItems[i] = systray.AddMenuItem(indicators[i].label+": --", "Click to show in menu bar")
+	}
 	systray.AddSeparator()
 
 	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
@@ -617,7 +660,22 @@ func onReady() {
 	// concurrently with itself.
 	go runUpdateWorker(appCtx)
 
-	// Event loop — handles menu interaction only.
+	// One goroutine per indicator forwards its clicks — the indicator count is
+	// dynamic, so a single static select cannot cover them.
+	for i := range indicators {
+		go func(idx int) {
+			for {
+				select {
+				case <-appCtx.Done():
+					return
+				case <-indicatorMenuItems[idx].ClickedCh:
+					selectIndicator(indicators[idx].key)
+				}
+			}
+		}(i)
+	}
+
+	// Event loop — handles non-indicator menu interaction.
 	go func() {
 		for {
 			select {
@@ -633,14 +691,6 @@ func onReady() {
 				go openConfigFile()
 			case <-mAbout.ClickedCh:
 				go showAboutDialog()
-			case <-mCurrentSession.ClickedCh:
-				selectIndicator("currentSession")
-			case <-mWeeklyAll.ClickedCh:
-				selectIndicator("weeklyAll")
-			case <-mWeeklySonnet.ClickedCh:
-				selectIndicator("weeklySonnet")
-			case <-mWeeklyDesign.ClickedCh:
-				selectIndicator("weeklyDesign")
 			}
 		}
 	}()
@@ -648,19 +698,22 @@ func onReady() {
 
 // selectIndicator switches which usage metric the menu bar shows, updating the
 // display immediately from cached data so the click feels instant.
-func selectIndicator(indicator string) {
-	setMenuBarIndicator(indicator)
+func selectIndicator(key string) {
+	setMenuBarIndicator(key)
 	updateMenuCheckmarks()
 
 	limitsMutex.RLock()
 	cached := lastLimits
 	limitsMutex.RUnlock()
 	if cached != nil {
+		// Re-apply visibility: the newly deselected window may now hide, and
+		// the newly selected one must show even if it has no data.
+		applyIndicatorMenu(cached)
 		updateMenuBarDisplay(cached)
 	}
 
 	go func() {
-		if err := SaveConfigPreservingSession(indicator); err != nil {
+		if err := SaveConfigPreservingSession(key); err != nil {
 			log.Printf("Failed to save menu bar indicator: %v", err)
 		}
 	}()
@@ -673,31 +726,41 @@ func openConfigFile() {
 	}
 }
 
-// showAboutDialog shows a small version dialog.
+// showAboutDialog shows a version dialog with a button that opens the project
+// on GitHub.
 func showAboutDialog() {
-	script := fmt.Sprintf(`display dialog "Claude Monitor Lite\nVersion: %s" buttons {"OK"} default button "OK" with title "About"`, version)
+	script := fmt.Sprintf(`display dialog "Claude Monitor Lite\nVersion: %s" buttons {"View on GitHub", "OK"} default button "OK" with title "About"
+if button returned of result is "View on GitHub" then open location "%s"`, version, githubURL)
 	if err := exec.Command("osascript", "-e", script).Start(); err != nil {
 		log.Printf("Failed to show about dialog: %v", err)
 	}
 }
 
 func updateMenuCheckmarks() {
-	mCurrentSession.Uncheck()
-	mWeeklyAll.Uncheck()
-	mWeeklySonnet.Uncheck()
-	mWeeklyDesign.Uncheck()
+	current := getMenuBarIndicator()
+	for i := range indicators {
+		if indicators[i].key == current {
+			indicatorMenuItems[i].Check()
+		} else {
+			indicatorMenuItems[i].Uncheck()
+		}
+	}
+}
 
-	switch appConfig.MenuBarIndicator {
-	case "currentSession":
-		mCurrentSession.Check()
-	case "weeklyAll":
-		mWeeklyAll.Check()
-	case "weeklySonnet":
-		mWeeklySonnet.Check()
-	case "weeklyDesign":
-		mWeeklyDesign.Check()
-	default:
-		mCurrentSession.Check()
+// applyIndicatorMenu refreshes every indicator menu item's title from limits and
+// hides the ones with no data, so the menu is not cluttered with permanently
+// empty windows. The selected indicator always stays visible — hiding it would
+// hide its checkmark and leave the user unable to see their current choice.
+func applyIndicatorMenu(limits *UsageLimits) {
+	selected := getMenuBarIndicator()
+	for i := range indicators {
+		limit := indicators[i].get(limits)
+		indicatorMenuItems[i].SetTitle(formatUsageWithReset(limit, indicators[i].label+":"))
+		if limit != nil || indicators[i].key == selected {
+			indicatorMenuItems[i].Show()
+		} else {
+			indicatorMenuItems[i].Hide()
+		}
 	}
 }
 
@@ -770,16 +833,20 @@ func updateStats() {
 		count := consecutiveErrors
 		consecutiveMutex.Unlock()
 
+		// The error message goes on the first item, which must be visible even
+		// if auto-hide had hidden it (e.g. the 5-hour window had no data).
 		switch classifyUpdate(err, count) {
 		case actionShowAuth:
-			mCurrentSession.SetTitle("Session expired - please login again")
+			indicatorMenuItems[0].Show()
+			indicatorMenuItems[0].SetTitle("Session expired - please login again")
 			systray.SetTitle("⚪ Login")
 		case actionKeepStale:
 			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
 		case actionShowError:
 			log.Printf("Error fetching usage: %v", err)
 			systray.SetTitle("⚪ Error")
-			mCurrentSession.SetTitle("Error loading data")
+			indicatorMenuItems[0].Show()
+			indicatorMenuItems[0].SetTitle("Error loading data")
 		}
 		return
 	}
@@ -789,11 +856,8 @@ func updateStats() {
 	consecutiveErrors = 0
 	consecutiveMutex.Unlock()
 
-	// Update menu items using helper functions
-	mCurrentSession.SetTitle(formatUsageWithReset(limits.FiveHour, "5-Hour Session:"))
-	mWeeklyAll.SetTitle(formatUsageWithReset(limits.SevenDay, "Weekly (All):"))
-	mWeeklySonnet.SetTitle(formatUsageWithReset(limits.SevenDaySonnet, "Weekly (Sonnet):"))
-	mWeeklyDesign.SetTitle(formatUsageWithReset(limits.SevenDayOmelette, "Weekly (Design):"))
+	// Refresh every indicator's title and hide the ones with no data.
+	applyIndicatorMenu(limits)
 
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()
