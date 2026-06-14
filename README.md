@@ -51,8 +51,26 @@ claude-monitor-lite
 claude-monitor-lite              # Start or show status
 claude-monitor-lite stop         # Stop the monitor
 claude-monitor-lite logout       # Clear session
+claude-monitor-lite install      # Start automatically at login
+claude-monitor-lite uninstall    # Stop starting at login
 claude-monitor-lite version      # Show version
 ```
+
+## Start at login
+
+Register a LaunchAgent so the monitor starts automatically when you log in:
+
+```bash
+claude-monitor-lite install
+```
+
+This writes `~/Library/LaunchAgents/io.github.wickes1.claude-monitor-lite.plist` pointing at the binary on your `PATH`, so it keeps working across `brew upgrade`. To disable:
+
+```bash
+claude-monitor-lite uninstall
+```
+
+A LaunchAgent owns the monitor's lifecycle: `uninstall` disables autostart and stops a monitor that autostart had started, and a reinstall restarts it. Start it again anytime with `claude-monitor-lite`.
 
 ## Troubleshooting
 

@@ -304,6 +304,10 @@ func main() {
 			handleStop()
 		case "logout":
 			handleLogout()
+		case "install":
+			handleInstall()
+		case "uninstall":
+			handleUninstall()
 		case "version", "--version", "-v":
 			fmt.Printf("claude-monitor-lite %s\n", version)
 			os.Exit(0)
@@ -330,6 +334,8 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite start        Same as above")
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
 	fmt.Println("  claude-monitor-lite logout       Clear session and stop monitor")
+	fmt.Println("  claude-monitor-lite install      Start automatically at login (LaunchAgent)")
+	fmt.Println("  claude-monitor-lite uninstall    Stop starting automatically at login")
 	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
 	fmt.Println()
