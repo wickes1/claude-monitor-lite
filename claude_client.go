@@ -16,6 +16,8 @@ import (
 
 const (
 	claudeAPIBaseURL    = "https://claude.ai/api"
+	oauthAPIBaseURL     = "https://api.anthropic.com/api"
+	oauthBetaHeader     = "oauth-2025-04-20"
 	defaultUserAgent    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 	requestTimeout      = 10 * time.Second
 	maxIdleConns        = 2
@@ -36,6 +38,8 @@ var sharedHTTPClient = newHTTPClient()
 
 type ClaudeUsageClient struct {
 	sessionKey     string
+	accessToken    string
+	authMode       string
 	httpClient     *http.Client
 	organizationID string
 	baseURL        string
@@ -205,6 +209,18 @@ func NewClaudeUsageClientWithOrg(sessionKey, organizationID string) *ClaudeUsage
 	return client
 }
 
+// NewOAuthUsageClient builds a client that authenticates with a Claude Code
+// OAuth access token against api.anthropic.com — the zero-paste path. No cookie
+// jar or organization lookup is needed; the token is account-scoped.
+func NewOAuthUsageClient(accessToken string) *ClaudeUsageClient {
+	return &ClaudeUsageClient{
+		accessToken: accessToken,
+		authMode:    AuthModeOAuth,
+		httpClient:  sharedHTTPClient,
+		baseURL:     oauthAPIBaseURL,
+	}
+}
+
 // seedCookieJar sets the initial sessionKey cookie in the jar so
 // subsequent requests via the jar include it automatically.
 func (c *ClaudeUsageClient) seedCookieJar() {
@@ -241,8 +257,17 @@ func (c *ClaudeUsageClient) doAPIRequest(ctx context.Context, apiURL string) (*h
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Accept", "application/json")
+	if c.authMode == AuthModeOAuth {
+		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+		req.Header.Set("anthropic-beta", oauthBetaHeader)
+		// Identify honestly as ourselves rather than spoofing claude-code; the
+		// endpoint accepts this, but a User-Agent must be present — a missing
+		// one triggers persistent 429s.
+		req.Header.Set("User-Agent", "claude-monitor-lite/"+version)
+	} else {
+		req.Header.Set("User-Agent", defaultUserAgent)
+	}
 
 	return c.httpClient.Do(req)
 }
@@ -257,15 +282,20 @@ func isTransientStatus(code int) bool {
 
 // GetUsageLimits fetches real-time usage limits from Claude API
 func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
-	// First, get organization ID if not already cached
-	if c.organizationID == "" {
-		if err := c.fetchOrganizationID(); err != nil {
-			return nil, fmt.Errorf("failed to get organization ID: %w", err)
+	var apiURL string
+	if c.authMode == AuthModeOAuth {
+		// OAuth tokens are account-scoped, so there is no org lookup and no org
+		// in the path — Claude Code hits this same endpoint behind its /usage view.
+		apiURL = fmt.Sprintf("%s/oauth/usage", c.baseURL)
+	} else {
+		// First, get organization ID if not already cached
+		if c.organizationID == "" {
+			if err := c.fetchOrganizationID(); err != nil {
+				return nil, fmt.Errorf("failed to get organization ID: %w", err)
+			}
 		}
+		apiURL = fmt.Sprintf("%s/organizations/%s/usage", c.baseURL, c.organizationID)
 	}
-
-	// Build the actual endpoint
-	apiURL := fmt.Sprintf("%s/organizations/%s/usage", c.baseURL, c.organizationID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
@@ -276,8 +306,10 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	}
 	defer resp.Body.Close()
 
-	// Pick up any refreshed sessionKey or Cloudflare cookies
-	c.refreshSessionFromJar()
+	// Pick up any refreshed sessionKey or Cloudflare cookies (cookie mode only)
+	if c.authMode != AuthModeOAuth {
+		c.refreshSessionFromJar()
+	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, fmt.Errorf("%w (status %d)", ErrAuthFailed, resp.StatusCode)

@@ -8,15 +8,51 @@ import (
 	"time"
 )
 
+// Authentication modes.
+const (
+	AuthModeOAuth  = "oauth"  // reuse Claude Code's login (zero-paste, default)
+	AuthModeCookie = "cookie" // legacy manual sessionKey paste
+)
+
 type AuthSession struct {
-	SessionKey     string    `json:"sessionKey"`
-	OrganizationID string    `json:"organizationId,omitempty"`
-	SavedAt        time.Time `json:"savedAt"`
+	AuthMode string `json:"authMode,omitempty"`
+
+	// OAuth credential (AuthModeOAuth).
+	AccessToken  string `json:"accessToken,omitempty"`
+	RefreshToken string `json:"refreshToken,omitempty"`
+	ExpiresAt    int64  `json:"expiresAt,omitempty"` // epoch milliseconds
+
+	// Cookie credential (AuthModeCookie).
+	SessionKey     string `json:"sessionKey,omitempty"`
+	OrganizationID string `json:"organizationId,omitempty"`
+
+	SavedAt time.Time `json:"savedAt"`
 }
 
 func LoadAuthSession() (*AuthSession, error) {
 	config := LoadConfig()
-	if config.SessionKey == "" {
+
+	mode := config.AuthMode
+	if mode == "" {
+		// Infer the mode for configs written before authMode existed.
+		switch {
+		case config.AccessToken != "":
+			mode = AuthModeOAuth
+		case config.SessionKey != "":
+			mode = AuthModeCookie
+		}
+	}
+
+	switch mode {
+	case AuthModeOAuth:
+		if config.AccessToken == "" {
+			return nil, fmt.Errorf("no session found")
+		}
+	case AuthModeCookie:
+		if config.SessionKey == "" {
+			return nil, fmt.Errorf("no session found")
+		}
+	default:
 		return nil, fmt.Errorf("no session found")
 	}
 
@@ -26,6 +62,10 @@ func LoadAuthSession() (*AuthSession, error) {
 	}
 
 	return &AuthSession{
+		AuthMode:       mode,
+		AccessToken:    config.AccessToken,
+		RefreshToken:   config.RefreshToken,
+		ExpiresAt:      config.ExpiresAt,
 		SessionKey:     config.SessionKey,
 		OrganizationID: config.OrganizationID,
 		SavedAt:        savedAt,
@@ -37,6 +77,10 @@ func SaveAuthSession(session *AuthSession) error {
 
 	// Only update auth fields, preserving other settings (menuBarIndicator)
 	return modifyAndSaveConfig(func(c *Config) {
+		c.AuthMode = session.AuthMode
+		c.AccessToken = session.AccessToken
+		c.RefreshToken = session.RefreshToken
+		c.ExpiresAt = session.ExpiresAt
 		c.SessionKey = session.SessionKey
 		c.OrganizationID = session.OrganizationID
 		c.SavedAt = &session.SavedAt
@@ -46,10 +90,35 @@ func SaveAuthSession(session *AuthSession) error {
 func ClearAuthSession() error {
 	// Only clear auth-related fields, preserve other settings (menuBarIndicator)
 	return modifyAndSaveConfig(func(c *Config) {
+		c.AuthMode = ""
+		c.AccessToken = ""
+		c.RefreshToken = ""
+		c.ExpiresAt = 0
 		c.SessionKey = ""
 		c.OrganizationID = ""
 		c.SavedAt = nil
 	})
+}
+
+// LoginWithClaudeCode reads Claude Code's existing OAuth credential and saves it
+// as our session — the zero-paste path. Returns an error if Claude Code is not
+// installed or not logged in, so callers can fall back to manual entry.
+func LoginWithClaudeCode() (*AuthSession, error) {
+	cred, err := ReadClaudeCodeCredential()
+	if err != nil {
+		return nil, err
+	}
+
+	session := &AuthSession{
+		AuthMode:     AuthModeOAuth,
+		AccessToken:  cred.AccessToken,
+		RefreshToken: cred.RefreshToken,
+		ExpiresAt:    cred.ExpiresAt,
+	}
+	if err := SaveAuthSession(session); err != nil {
+		return nil, fmt.Errorf("failed to save session: %w", err)
+	}
+	return session, nil
 }
 
 // LoginWithBrowser opens browser and guides user through manual session key extraction
@@ -110,6 +179,7 @@ func extractSessionManually() (*AuthSession, error) {
 	sessionKey = strings.Trim(sessionKey, "\"'")
 
 	session := &AuthSession{
+		AuthMode:   AuthModeCookie,
 		SessionKey: sessionKey,
 	}
 

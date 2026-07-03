@@ -17,8 +17,19 @@ const (
 var configWriteMutex sync.Mutex
 
 type Config struct {
-	SessionKey       string     `json:"sessionKey,omitempty"`
-	OrganizationID   string     `json:"organizationId,omitempty"`
+	// AuthMode selects how we authenticate: "oauth" (reuse Claude Code's login,
+	// the zero-paste default) or "cookie" (legacy manual sessionKey paste).
+	AuthMode string `json:"authMode,omitempty"`
+
+	// OAuth credential, sourced from Claude Code's on-disk credential.
+	AccessToken  string `json:"accessToken,omitempty"`
+	RefreshToken string `json:"refreshToken,omitempty"`
+	ExpiresAt    int64  `json:"expiresAt,omitempty"` // epoch milliseconds
+
+	// Legacy cookie auth.
+	SessionKey     string `json:"sessionKey,omitempty"`
+	OrganizationID string `json:"organizationId,omitempty"`
+
 	SavedAt          *time.Time `json:"savedAt,omitempty"`
 	MenuBarIndicator string     `json:"menuBarIndicator"`
 }

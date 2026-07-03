@@ -122,10 +122,60 @@ func isValidIndicator(key string) bool {
 
 // Helper function to create Claude client from session
 func createClientFromSession(session *AuthSession) *ClaudeUsageClient {
+	if session.AuthMode == AuthModeOAuth {
+		return NewOAuthUsageClient(session.AccessToken)
+	}
 	if session.OrganizationID != "" {
 		return NewClaudeUsageClientWithOrg(session.SessionKey, session.OrganizationID)
 	}
 	return NewClaudeUsageClient(session.SessionKey)
+}
+
+// tryRefreshOAuthSession recovers an expired OAuth session without user
+// interaction, then rebuilds the live client. It prefers re-reading Claude
+// Code's (self-refreshing) credential — which never risks rotating a refresh
+// token out from under Claude Code — and only falls back to refreshing via our
+// stored refresh token. Returns true if the session was recovered.
+//
+// Called only from the update worker goroutine, the sole owner of claudeClient,
+// so the reassignment needs no lock.
+// Returns nil on success; ErrTransient if the refresh failed only transiently
+// (so the caller can keep last-good data instead of forcing a re-login); or
+// ErrAuthFailed when the session genuinely cannot be refreshed.
+func tryRefreshOAuthSession() error {
+	session, err := LoadAuthSession()
+	if err != nil || session.AuthMode != AuthModeOAuth {
+		return ErrAuthFailed
+	}
+	// Prefer Claude Code's own (self-refreshing) credential — this never rotates
+	// its refresh token out from under it.
+	if cred, err := ReadClaudeCodeCredential(); err == nil && !cred.expired() {
+		applyRefreshedCredential(session, cred)
+		return nil
+	}
+	// Last resort: refresh via our stored refresh token. Surface the failure
+	// kind so the caller can tell a transient blip from a dead token.
+	if session.RefreshToken != "" {
+		cred, err := RefreshAccessToken(session.RefreshToken)
+		if err != nil {
+			return err
+		}
+		applyRefreshedCredential(session, cred)
+		return nil
+	}
+	return ErrAuthFailed
+}
+
+func applyRefreshedCredential(session *AuthSession, cred *OAuthCredential) {
+	session.AccessToken = cred.AccessToken
+	if cred.RefreshToken != "" {
+		session.RefreshToken = cred.RefreshToken
+	}
+	session.ExpiresAt = cred.ExpiresAt
+	if err := SaveAuthSession(session); err != nil {
+		log.Printf("Failed to persist refreshed session: %v", err)
+	}
+	claudeClient = createClientFromSession(session)
 }
 
 // getMenuBarIndicator and setMenuBarIndicator guard appConfig.MenuBarIndicator,
@@ -448,6 +498,24 @@ func validateSession(client *ClaudeUsageClient, attempts int, delay time.Duratio
 }
 
 func handleLoginFlow() (*AuthSession, error) {
+	// Zero-paste path: reuse Claude Code's existing login if present.
+	if session, err := LoginWithClaudeCode(); err == nil {
+		fmt.Println("✓ Connected using your Claude Code login — no copy-paste needed.")
+		fmt.Println()
+		if limits, err := createClientFromSession(session).GetUsageLimits(); err != nil {
+			fmt.Printf("Note: Could not fetch usage data: %v\n", err)
+			fmt.Println()
+		} else {
+			displayUsageStats(limits)
+		}
+		return session, nil
+	} else {
+		fmt.Printf("Claude Code login not found (%v).\n", err)
+		fmt.Println("Falling back to manual session key entry.")
+		fmt.Println()
+	}
+
+	// Fallback: manual sessionKey paste.
 	session, err := LoginWithBrowser()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Login failed: %v\n", err)
@@ -674,8 +742,17 @@ func onReady() {
 	systray.SetTitle("⚪ Loading...")
 	systray.SetTooltip("Claude Monitor Lite")
 
-	// Check authentication
+	// Check authentication. With no stored session, try the zero-paste Claude
+	// Code path before asking the user to do anything.
 	session, err := LoadAuthSession()
+	if err != nil {
+		if s, e := LoginWithClaudeCode(); e == nil {
+			session, err = s, nil
+		} else {
+			// Daemon has no terminal, so log why auto-login fell through.
+			log.Printf("Claude Code auto-login unavailable: %v", e)
+		}
+	}
 	if err != nil {
 		systray.SetTitle("⚪ Not logged in")
 		mLogin := systray.AddMenuItem("⚠️  Please login first", "Login required")
@@ -880,6 +957,18 @@ func updateStats() {
 	}
 
 	limits, err := claudeClient.GetUsageLimits()
+	if err != nil && errors.Is(err, ErrAuthFailed) {
+		// An OAuth access token likely expired — try a silent refresh and one
+		// retry before telling the user to log in again.
+		switch refreshErr := tryRefreshOAuthSession(); {
+		case refreshErr == nil:
+			limits, err = claudeClient.GetUsageLimits()
+		case errors.Is(refreshErr, ErrTransient):
+			// Refresh was only rate-limited/transient — keep last-good data and
+			// retry next tick rather than telling a logged-in user to re-login.
+			err = ErrTransient
+		}
+	}
 	if err != nil {
 		consecutiveMutex.Lock()
 		consecutiveErrors++
