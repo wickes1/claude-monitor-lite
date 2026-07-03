@@ -30,14 +30,14 @@ go install github.com/wickes1/claude-monitor-lite@latest
 claude-monitor-lite
 ```
 
-**First run setup:**
-1. Browser opens to claude.ai
-2. Log in to your account
-3. Open DevTools (F12 or Cmd+Option+I)
-4. Navigate to: Application → Cookies → https://claude.ai
-5. Copy the `sessionKey` value
-6. Paste when prompted
-7. Monitor starts and appears in your menu bar
+**First run:** the monitor reuses your existing Claude Code login — nothing to copy or paste. Install Claude Code and sign in once, then run `claude-monitor-lite`. It reads Claude Code's credential at runtime (Keychain on macOS, `~/.claude/.credentials.json` on other platforms), holds it in memory only, and never stores a token of its own.
+
+**Manual fallback (no Claude Code):** without Claude Code, the monitor falls back to a session key:
+1. A browser opens to claude.ai — log in
+2. Open DevTools → Application → Cookies → https://claude.ai
+3. Copy the `sessionKey` value and paste when prompted
+
+The session key is saved to `~/.claude-monitor-lite.json`; the Claude Code path above saves nothing.
 
 **Already running:** The command shows current status.
 
