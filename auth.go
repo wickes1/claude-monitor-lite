@@ -14,40 +14,34 @@ const (
 	AuthModeCookie = "cookie" // legacy manual sessionKey paste
 )
 
+// AuthSession is an in-memory transfer struct passed between the login flow and
+// the client; it is never serialized. Config (config.go) holds the on-disk
+// contract, so these fields carry no json tags.
 type AuthSession struct {
-	AuthMode string `json:"authMode,omitempty"`
-
-	// OAuth credential (AuthModeOAuth).
-	AccessToken  string `json:"accessToken,omitempty"`
-	RefreshToken string `json:"refreshToken,omitempty"`
-	ExpiresAt    int64  `json:"expiresAt,omitempty"` // epoch milliseconds
+	AuthMode string
 
 	// Cookie credential (AuthModeCookie).
-	SessionKey     string `json:"sessionKey,omitempty"`
-	OrganizationID string `json:"organizationId,omitempty"`
+	SessionKey     string
+	OrganizationID string
 
-	SavedAt time.Time `json:"savedAt"`
+	SavedAt time.Time
 }
 
 func LoadAuthSession() (*AuthSession, error) {
 	config := LoadConfig()
 
 	mode := config.AuthMode
-	if mode == "" {
+	if mode == "" && config.SessionKey != "" {
 		// Infer the mode for configs written before authMode existed.
-		switch {
-		case config.AccessToken != "":
-			mode = AuthModeOAuth
-		case config.SessionKey != "":
-			mode = AuthModeCookie
-		}
+		mode = AuthModeCookie
 	}
 
 	switch mode {
 	case AuthModeOAuth:
-		if config.AccessToken == "" {
-			return nil, fmt.Errorf("no session found")
-		}
+		// Credential availability (Claude Code installed and logged in) is
+		// checked lazily at fetch time via CurrentOAuthToken, not here — that
+		// keeps this check cheap and keeps it from touching the Keychain just
+		// to report whether a session exists.
 	case AuthModeCookie:
 		if config.SessionKey == "" {
 			return nil, fmt.Errorf("no session found")
@@ -63,9 +57,6 @@ func LoadAuthSession() (*AuthSession, error) {
 
 	return &AuthSession{
 		AuthMode:       mode,
-		AccessToken:    config.AccessToken,
-		RefreshToken:   config.RefreshToken,
-		ExpiresAt:      config.ExpiresAt,
 		SessionKey:     config.SessionKey,
 		OrganizationID: config.OrganizationID,
 		SavedAt:        savedAt,
@@ -75,12 +66,11 @@ func LoadAuthSession() (*AuthSession, error) {
 func SaveAuthSession(session *AuthSession) error {
 	session.SavedAt = time.Now()
 
-	// Only update auth fields, preserving other settings (menuBarIndicator)
+	// Only update auth fields, preserving other settings (menuBarIndicator).
+	// Deliberately no token fields: the OAuth access/refresh token is never
+	// written to this config — see the AuthMode field doc on Config.
 	return modifyAndSaveConfig(func(c *Config) {
 		c.AuthMode = session.AuthMode
-		c.AccessToken = session.AccessToken
-		c.RefreshToken = session.RefreshToken
-		c.ExpiresAt = session.ExpiresAt
 		c.SessionKey = session.SessionKey
 		c.OrganizationID = session.OrganizationID
 		c.SavedAt = &session.SavedAt
@@ -91,30 +81,25 @@ func ClearAuthSession() error {
 	// Only clear auth-related fields, preserve other settings (menuBarIndicator)
 	return modifyAndSaveConfig(func(c *Config) {
 		c.AuthMode = ""
-		c.AccessToken = ""
-		c.RefreshToken = ""
-		c.ExpiresAt = 0
 		c.SessionKey = ""
 		c.OrganizationID = ""
 		c.SavedAt = nil
 	})
 }
 
-// LoginWithClaudeCode reads Claude Code's existing OAuth credential and saves it
-// as our session — the zero-paste path. Returns an error if Claude Code is not
-// installed or not logged in, so callers can fall back to manual entry.
+// LoginWithClaudeCode verifies Claude Code has a usable login and records that
+// we should use it — the zero-paste path. No token is stored: the OAuth
+// access/refresh token stays in Claude Code's own credential store (Keychain
+// on macOS, .credentials.json elsewhere) and is read fresh, in memory only,
+// at fetch time via CurrentOAuthToken (credentials.go). Returns an error if
+// Claude Code is not installed or not logged in, so callers can fall back to
+// manual entry.
 func LoginWithClaudeCode() (*AuthSession, error) {
-	cred, err := ReadClaudeCodeCredential()
-	if err != nil {
+	if _, err := ReadClaudeCodeCredential(); err != nil {
 		return nil, err
 	}
 
-	session := &AuthSession{
-		AuthMode:     AuthModeOAuth,
-		AccessToken:  cred.AccessToken,
-		RefreshToken: cred.RefreshToken,
-		ExpiresAt:    cred.ExpiresAt,
-	}
+	session := &AuthSession{AuthMode: AuthModeOAuth}
 	if err := SaveAuthSession(session); err != nil {
 		return nil, fmt.Errorf("failed to save session: %w", err)
 	}

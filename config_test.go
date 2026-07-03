@@ -138,3 +138,37 @@ func TestLoadConfigRejectsUnknownIndicator(t *testing.T) {
 		t.Errorf("stale indicator = %q, want fallback 'currentSession'", got.MenuBarIndicator)
 	}
 }
+
+// withTempConfigPath points GetConfigPath at a fresh temp file for the
+// duration of the test (restoring the previous override on cleanup), so any
+// test that goes through the package-level Load/Save/Clear/migrate helpers —
+// which all resolve their path via GetConfigPath — never reads or writes the
+// real ~/.claude-monitor-lite.json. Shared by auth_test.go and main_test.go.
+func withTempConfigPath(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	old := configPathOverride
+	configPathOverride = path
+	t.Cleanup(func() { configPathOverride = old })
+	return path
+}
+
+// GetConfigPath must honor configPathOverride when set, and fall back to the
+// real home-directory path otherwise — the seam every other config-path test
+// in this package relies on.
+func TestGetConfigPath_HonorsOverride(t *testing.T) {
+	old := configPathOverride
+	defer func() { configPathOverride = old }()
+
+	configPathOverride = "/tmp/example-override.json"
+	if got := GetConfigPath(); got != "/tmp/example-override.json" {
+		t.Errorf("GetConfigPath() = %q, want override path", got)
+	}
+
+	configPathOverride = ""
+	homeDir, _ := os.UserHomeDir()
+	want := filepath.Join(homeDir, ".claude-monitor-lite.json")
+	if got := GetConfigPath(); got != want {
+		t.Errorf("GetConfigPath() = %q, want %q", got, want)
+	}
+}

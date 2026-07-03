@@ -370,6 +370,50 @@ func TestUnknownTopLevelKeys_LiveFixtureHasNone(t *testing.T) {
 	}
 }
 
+// NewOAuthUsageClient must send the token its provider returns as a Bearer
+// header, alongside the OAuth beta header the endpoint requires.
+func TestNewOAuthUsageClient_SendsProviderTokenAndBetaHeader(t *testing.T) {
+	var gotAuth, gotBeta string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer srv.Close()
+
+	c := NewOAuthUsageClient(func() (string, error) { return "provider-token", nil })
+	c.baseURL = srv.URL
+
+	if _, err := c.GetUsageLimits(); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if gotAuth != "Bearer provider-token" {
+		t.Errorf("Authorization header = %q, want %q", gotAuth, "Bearer provider-token")
+	}
+	if gotBeta != oauthBetaHeader {
+		t.Errorf("anthropic-beta header = %q, want %q", gotBeta, oauthBetaHeader)
+	}
+}
+
+// A token provider failure (e.g. Claude Code not installed, or its refresh
+// token exhausted) must surface as ErrAuthFailed and must never reach the
+// network — the request is never sent.
+func TestNewOAuthUsageClient_ProviderError_WrapsErrAuthFailedWithoutRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("HTTP request should not be made when the token provider fails")
+	}))
+	defer srv.Close()
+
+	c := NewOAuthUsageClient(func() (string, error) { return "", errors.New("no credential") })
+	c.baseURL = srv.URL
+
+	_, err := c.GetUsageLimits()
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("expected ErrAuthFailed, got: %v", err)
+	}
+}
+
 func TestIsTransientStatus(t *testing.T) {
 	transient := []int{408, 429, 500, 502, 503, 504}
 	for _, code := range transient {

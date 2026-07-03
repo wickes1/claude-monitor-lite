@@ -38,7 +38,7 @@ var sharedHTTPClient = newHTTPClient()
 
 type ClaudeUsageClient struct {
 	sessionKey     string
-	accessToken    string
+	tokenProvider  func() (string, error)
 	authMode       string
 	httpClient     *http.Client
 	organizationID string
@@ -209,15 +209,19 @@ func NewClaudeUsageClientWithOrg(sessionKey, organizationID string) *ClaudeUsage
 	return client
 }
 
-// NewOAuthUsageClient builds a client that authenticates with a Claude Code
-// OAuth access token against api.anthropic.com — the zero-paste path. No cookie
-// jar or organization lookup is needed; the token is account-scoped.
-func NewOAuthUsageClient(accessToken string) *ClaudeUsageClient {
+// NewOAuthUsageClient builds a client that authenticates against
+// api.anthropic.com with a token pulled from tokenProvider on every request —
+// the zero-paste path. tokenProvider is CurrentOAuthToken in production
+// (credentials.go): it reads Claude Code's own credential fresh, in memory
+// only, so no access token is ever stored on this struct or persisted to our
+// config. No cookie jar or organization lookup is needed; the token is
+// account-scoped.
+func NewOAuthUsageClient(tokenProvider func() (string, error)) *ClaudeUsageClient {
 	return &ClaudeUsageClient{
-		accessToken: accessToken,
-		authMode:    AuthModeOAuth,
-		httpClient:  sharedHTTPClient,
-		baseURL:     oauthAPIBaseURL,
+		tokenProvider: tokenProvider,
+		authMode:      AuthModeOAuth,
+		httpClient:    sharedHTTPClient,
+		baseURL:       oauthAPIBaseURL,
 	}
 }
 
@@ -259,7 +263,18 @@ func (c *ClaudeUsageClient) doAPIRequest(ctx context.Context, apiURL string) (*h
 
 	req.Header.Set("Accept", "application/json")
 	if c.authMode == AuthModeOAuth {
-		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+		token, err := c.tokenProvider()
+		if err != nil {
+			// A transient provider failure (e.g. Claude Code's token is briefly
+			// expired between its own background refreshes) must stay transient —
+			// masking it as an auth failure would wrongly tell a logged-in user
+			// to sign in again.
+			if errors.Is(err, ErrTransient) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %v", ErrAuthFailed, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("anthropic-beta", oauthBetaHeader)
 		// Identify honestly as ourselves rather than spoofing claude-code; the
 		// endpoint accepts this, but a User-Agent must be present — a missing
@@ -302,6 +317,14 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 
 	resp, err := c.doAPIRequest(ctx, apiURL)
 	if err != nil {
+		// A request that never went out (e.g. the OAuth token provider
+		// failed) already carries a specific classification from
+		// doAPIRequest — preserve it so an auth failure is never misreported
+		// as a transient blip. Anything else here is a raw network-level
+		// Do() failure, which is transient by nature.
+		if errors.Is(err, ErrAuthFailed) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrTransient, err)
 	}
 	defer resp.Body.Close()

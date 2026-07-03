@@ -5,29 +5,27 @@
 // same usage endpoint Claude Code uses, so the user never has to copy a session
 // key out of the browser by hand. We never run our own login flow, never proxy
 // inference, and never write back to Claude Code's credential store.
+//
+// The token itself is never persisted to our own config either: CurrentOAuthToken
+// below reads it fresh from Claude Code's store on demand and caches it in
+// memory only, for this process's lifetime. Writing a copy of Claude Code's
+// broad-scope credential into our plaintext dotfile would be a downgrade from
+// the Keychain and an unnecessary second copy of the same secret.
 package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 )
 
 const (
-	// claudeOAuthClientID is the public client_id shared across the Claude Code
-	// CLI ecosystem. It is used only to refresh an access token we already
-	// obtained from Claude Code's own on-disk credential.
-	claudeOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	claudeOAuthTokenURL = "https://platform.claude.com/v1/oauth/token"
-
 	// keychainService is the macOS Keychain item Claude Code stores its
 	// credential under on newer versions.
 	keychainService = "Claude Code-credentials"
@@ -37,12 +35,25 @@ const (
 	tokenRefreshLeeway = 2 * time.Minute
 )
 
+// oauthTokenMu guards cachedOAuthCredential. CurrentOAuthToken and
+// InvalidateOAuthToken are the only functions that may touch it. The cache
+// lives in memory for this process only — it is never marshaled to our
+// config file, so a compromised dotfile can no longer impersonate Claude
+// Code's own broad-scope subscription credential.
+var (
+	oauthTokenMu          sync.Mutex
+	cachedOAuthCredential *OAuthCredential
+
+	// readCredential indirects ReadClaudeCodeCredential so tests can substitute
+	// a fake without touching the real Keychain or credentials file.
+	readCredential = ReadClaudeCodeCredential
+)
+
 // OAuthCredential is the claudeAiOauth block Claude Code persists.
 type OAuthCredential struct {
-	AccessToken      string `json:"accessToken"`
-	RefreshToken     string `json:"refreshToken"`
-	ExpiresAt        int64  `json:"expiresAt"` // epoch milliseconds
-	SubscriptionType string `json:"subscriptionType,omitempty"`
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresAt    int64  `json:"expiresAt"` // epoch milliseconds
 }
 
 // expired reports whether the access token is within the refresh leeway of (or
@@ -117,65 +128,56 @@ func parseCredential(data []byte) (*OAuthCredential, error) {
 	return f.ClaudeAiOauth, nil
 }
 
-// RefreshAccessToken exchanges a refresh token for a fresh access token via the
-// public OAuth token endpoint. The result is persisted to OUR config only; we
-// never write back to Claude Code's store. This is a last-resort path: callers
-// prefer re-reading Claude Code's (self-refreshing) credential first, since a
-// provider may rotate the refresh token and we must not invalidate Claude
-// Code's own session.
-func RefreshAccessToken(refreshToken string) (*OAuthCredential, error) {
-	payload, _ := json.Marshal(map[string]string{
-		"grant_type":    "refresh_token",
-		"refresh_token": refreshToken,
-		"client_id":     claudeOAuthClientID,
-	})
+// CurrentOAuthToken returns a currently-valid Claude Code OAuth access token
+// for the calling request. It never touches our own config file — the token
+// is cached in memory only, for this process's lifetime.
+//
+// Resolution order:
+//  1. A cached, non-expired credential is returned as-is.
+//  2. Otherwise, Claude Code's own on-disk credential is re-read. Claude Code
+//     refreshes its own token in the background, so a fresh read is what keeps
+//     this working — we never spend Claude Code's refresh grant ourselves,
+//     because rotating its refresh token could force the user to sign back
+//     into Claude Code.
+//  3. If that re-read credential is itself expired, we report a transient
+//     error and wait for Claude Code to refresh it, rather than refreshing on
+//     its behalf.
+//
+// Returns ErrTransient when Claude Code's credential is present but expired
+// (Claude Code will refresh it shortly); returns the underlying read error if
+// Claude Code's credential store could not be read at all (not installed, not
+// logged in).
+func CurrentOAuthToken() (string, error) {
+	oauthTokenMu.Lock()
+	defer oauthTokenMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	defer cancel()
+	if cachedOAuthCredential != nil && !cachedOAuthCredential.expired() {
+		return cachedOAuthCredential.AccessToken, nil
+	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", claudeOAuthTokenURL, bytes.NewReader(payload))
+	cred, err := readCredential()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "claude-monitor-lite/"+version)
-
-	resp, err := sharedHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrTransient, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, ErrAuthFailed
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: token refresh status %d: %s", ErrTransient, resp.StatusCode, string(body))
+	if !cred.expired() {
+		cachedOAuthCredential = cred
+		return cred.AccessToken, nil
 	}
 
-	var r struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, fmt.Errorf("%w: decode refresh response: %v", ErrTransient, err)
-	}
-	if r.AccessToken == "" {
-		return nil, fmt.Errorf("token refresh returned an empty access_token")
-	}
+	// Claude Code's own access token is expired. We deliberately do NOT spend
+	// its refresh token: the OAuth server rotates refresh tokens on use, so
+	// refreshing here would consume Claude Code's grant and could force the
+	// user to sign back into Claude Code. Wait for Claude Code to refresh its
+	// own credential and report transient so the caller keeps last-good data.
+	return "", fmt.Errorf("%w: Claude Code's access token is expired; waiting for it to refresh", ErrTransient)
+}
 
-	cred := &OAuthCredential{
-		AccessToken:  r.AccessToken,
-		RefreshToken: r.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(r.ExpiresIn) * time.Second).UnixMilli(),
-	}
-	// Some providers omit a rotated refresh token; keep the existing one so a
-	// future refresh still has something to present.
-	if cred.RefreshToken == "" {
-		cred.RefreshToken = refreshToken
-	}
-	return cred, nil
+// InvalidateOAuthToken drops the in-memory cached credential. Call it after an
+// API request rejects the current token (a 401), so the next CurrentOAuthToken
+// call re-reads (and refreshes, if needed) instead of handing out the same
+// token the server just refused.
+func InvalidateOAuthToken() {
+	oauthTokenMu.Lock()
+	defer oauthTokenMu.Unlock()
+	cachedOAuthCredential = nil
 }

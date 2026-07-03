@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -222,5 +223,85 @@ func TestExtraUsageWindow(t *testing.T) {
 	w := extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{IsEnabled: true, Utilization: &util}})
 	if w == nil || w.Utilization != 25.0 {
 		t.Errorf("extraUsageWindow(enabled 25%%) = %+v, want utilization 25", w)
+	}
+}
+
+// migrateStripLegacySecrets must rewrite an old plaintext config that still
+// carries a Claude Code access/refresh token, dropping the secret fields
+// while preserving unrelated settings.
+func TestMigrateStripLegacySecrets_RemovesLegacyTokenFields(t *testing.T) {
+	path := withTempConfigPath(t)
+
+	legacyJSON := `{
+		"authMode": "oauth",
+		"accessToken": "sk-ant-oat01-legacy-secret",
+		"refreshToken": "sk-ant-ort01-legacy-secret",
+		"expiresAt": 1234567890000,
+		"menuBarIndicator": "weeklyAll"
+	}`
+	if err := os.WriteFile(path, []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("failed to seed legacy config: %v", err)
+	}
+
+	migrateStripLegacySecrets()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read migrated config: %v", err)
+	}
+	got := string(raw)
+
+	for _, secret := range []string{"accessToken", "refreshToken", "expiresAt"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("migrated config still contains %q:\n%s", secret, got)
+		}
+	}
+
+	var c Config
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("migrated config is not valid JSON: %v", err)
+	}
+	if c.AuthMode != "oauth" {
+		t.Errorf("AuthMode = %q, want preserved %q", c.AuthMode, "oauth")
+	}
+	if c.MenuBarIndicator != "weeklyAll" {
+		t.Errorf("MenuBarIndicator = %q, want preserved %q", c.MenuBarIndicator, "weeklyAll")
+	}
+}
+
+// A config file that is already clean (no legacy secret fields) must not be
+// rewritten at all.
+func TestMigrateStripLegacySecrets_NoopOnCleanConfig(t *testing.T) {
+	path := withTempConfigPath(t)
+
+	cleanJSON := `{"authMode":"oauth","menuBarIndicator":"weeklyAll"}`
+	if err := os.WriteFile(path, []byte(cleanJSON), 0600); err != nil {
+		t.Fatalf("failed to seed config: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	migrateStripLegacySecrets()
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("migrateStripLegacySecrets rewrote an already-clean config file")
+	}
+}
+
+// A missing config file (fresh install, never run before) must be a silent
+// no-op — no panic, no file created.
+func TestMigrateStripLegacySecrets_NoopOnMissingFile(t *testing.T) {
+	path := withTempConfigPath(t) // points at a path that does not exist yet
+
+	migrateStripLegacySecrets()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected no config file to be created, stat err = %v", err)
 	}
 }

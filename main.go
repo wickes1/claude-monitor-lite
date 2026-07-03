@@ -123,59 +123,12 @@ func isValidIndicator(key string) bool {
 // Helper function to create Claude client from session
 func createClientFromSession(session *AuthSession) *ClaudeUsageClient {
 	if session.AuthMode == AuthModeOAuth {
-		return NewOAuthUsageClient(session.AccessToken)
+		return NewOAuthUsageClient(CurrentOAuthToken)
 	}
 	if session.OrganizationID != "" {
 		return NewClaudeUsageClientWithOrg(session.SessionKey, session.OrganizationID)
 	}
 	return NewClaudeUsageClient(session.SessionKey)
-}
-
-// tryRefreshOAuthSession recovers an expired OAuth session without user
-// interaction, then rebuilds the live client. It prefers re-reading Claude
-// Code's (self-refreshing) credential — which never risks rotating a refresh
-// token out from under Claude Code — and only falls back to refreshing via our
-// stored refresh token. Returns true if the session was recovered.
-//
-// Called only from the update worker goroutine, the sole owner of claudeClient,
-// so the reassignment needs no lock.
-// Returns nil on success; ErrTransient if the refresh failed only transiently
-// (so the caller can keep last-good data instead of forcing a re-login); or
-// ErrAuthFailed when the session genuinely cannot be refreshed.
-func tryRefreshOAuthSession() error {
-	session, err := LoadAuthSession()
-	if err != nil || session.AuthMode != AuthModeOAuth {
-		return ErrAuthFailed
-	}
-	// Prefer Claude Code's own (self-refreshing) credential — this never rotates
-	// its refresh token out from under it.
-	if cred, err := ReadClaudeCodeCredential(); err == nil && !cred.expired() {
-		applyRefreshedCredential(session, cred)
-		return nil
-	}
-	// Last resort: refresh via our stored refresh token. Surface the failure
-	// kind so the caller can tell a transient blip from a dead token.
-	if session.RefreshToken != "" {
-		cred, err := RefreshAccessToken(session.RefreshToken)
-		if err != nil {
-			return err
-		}
-		applyRefreshedCredential(session, cred)
-		return nil
-	}
-	return ErrAuthFailed
-}
-
-func applyRefreshedCredential(session *AuthSession, cred *OAuthCredential) {
-	session.AccessToken = cred.AccessToken
-	if cred.RefreshToken != "" {
-		session.RefreshToken = cred.RefreshToken
-	}
-	session.ExpiresAt = cred.ExpiresAt
-	if err := SaveAuthSession(session); err != nil {
-		log.Printf("Failed to persist refreshed session: %v", err)
-	}
-	claudeClient = createClientFromSession(session)
 }
 
 // getMenuBarIndicator and setMenuBarIndicator guard appConfig.MenuBarIndicator,
@@ -384,8 +337,36 @@ func updateMenuBarDisplay(limits *UsageLimits) {
 	}
 }
 
+// migrateStripLegacySecrets rewrites the config file once if it still carries
+// a plaintext OAuth token from a version predating this security fix — the
+// access/refresh token used to be copied from Claude Code's credential store
+// into our own config; it now lives only in memory (see CurrentOAuthToken in
+// credentials.go). Config no longer declares those fields, so re-marshaling
+// the already-parsed struct is enough to drop them. A no-op if the config
+// file is absent or already clean, so this costs one read on every normal
+// startup.
+func migrateStripLegacySecrets() {
+	data, err := os.ReadFile(GetConfigPath())
+	if err != nil {
+		return // no config file yet - nothing to migrate
+	}
+
+	raw := string(data)
+	hasLegacySecret := strings.Contains(raw, "accessToken") ||
+		strings.Contains(raw, "refreshToken") ||
+		strings.Contains(raw, "expiresAt")
+	if !hasLegacySecret {
+		return
+	}
+
+	if err := modifyAndSaveConfig(func(c *Config) {}); err != nil {
+		log.Printf("Failed to migrate legacy plaintext token out of config: %v", err)
+	}
+}
+
 func main() {
 	appConfig = LoadConfig()
+	migrateStripLegacySecrets()
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -957,17 +938,14 @@ func updateStats() {
 	}
 
 	limits, err := claudeClient.GetUsageLimits()
-	if err != nil && errors.Is(err, ErrAuthFailed) {
-		// An OAuth access token likely expired — try a silent refresh and one
-		// retry before telling the user to log in again.
-		switch refreshErr := tryRefreshOAuthSession(); {
-		case refreshErr == nil:
-			limits, err = claudeClient.GetUsageLimits()
-		case errors.Is(refreshErr, ErrTransient):
-			// Refresh was only rate-limited/transient — keep last-good data and
-			// retry next tick rather than telling a logged-in user to re-login.
-			err = ErrTransient
-		}
+	if err != nil && errors.Is(err, ErrAuthFailed) && claudeClient.authMode == AuthModeOAuth {
+		// The cached in-memory token was rejected. Drop it and retry once so
+		// the provider (CurrentOAuthToken) re-reads — and, if needed,
+		// refreshes — Claude Code's credential before we tell an actually
+		// logged-in user to log in again. There is no stored refresh token of
+		// our own to fall back to; CurrentOAuthToken owns that entirely.
+		InvalidateOAuthToken()
+		limits, err = claudeClient.GetUsageLimits()
 	}
 	if err != nil {
 		consecutiveMutex.Lock()

@@ -19,12 +19,14 @@ var configWriteMutex sync.Mutex
 type Config struct {
 	// AuthMode selects how we authenticate: "oauth" (reuse Claude Code's login,
 	// the zero-paste default) or "cookie" (legacy manual sessionKey paste).
+	//
+	// The OAuth access/refresh token itself is never stored here. It lives in
+	// Claude Code's own credential store (Keychain on macOS, .credentials.json
+	// elsewhere) and is read fresh, in memory only, at fetch time — see
+	// CurrentOAuthToken in credentials.go. Persisting a copy here would
+	// duplicate a broad-scope credential into a plaintext dotfile, a downgrade
+	// from the Keychain.
 	AuthMode string `json:"authMode,omitempty"`
-
-	// OAuth credential, sourced from Claude Code's on-disk credential.
-	AccessToken  string `json:"accessToken,omitempty"`
-	RefreshToken string `json:"refreshToken,omitempty"`
-	ExpiresAt    int64  `json:"expiresAt,omitempty"` // epoch milliseconds
 
 	// Legacy cookie auth.
 	SessionKey     string `json:"sessionKey,omitempty"`
@@ -34,7 +36,15 @@ type Config struct {
 	MenuBarIndicator string     `json:"menuBarIndicator"`
 }
 
+// configPathOverride, when non-empty, is used instead of the default
+// ~/.claude-monitor-lite.json path. Tests set this to a temp file so they
+// never read or write the real config.
+var configPathOverride string
+
 func GetConfigPath() string {
+	if configPathOverride != "" {
+		return configPathOverride
+	}
 	homeDir, _ := os.UserHomeDir()
 	return filepath.Join(homeDir, ".claude-monitor-lite.json")
 }
