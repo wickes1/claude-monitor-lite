@@ -10,6 +10,10 @@ permissions:
 
 jobs:
   build-linux:
+    # Run after GoReleaser has created the release for the tag, then append the
+    # Linux artifact to it. Running both jobs in parallel raced to create the
+    # same tagged release and intermittently failed with "tag_name already_exists".
+    needs: release-macos
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
