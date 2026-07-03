@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/cookiejar"
@@ -167,6 +168,205 @@ func TestGetUsageLimits_FullAPIResponse_AllFieldsParsed(t *testing.T) {
 		limits.ExtraUsage.Utilization != nil || limits.ExtraUsage.Currency != nil ||
 		limits.ExtraUsage.DisabledReason != nil {
 		t.Errorf("ExtraUsage detail fields should be nil when disabled: %+v", limits.ExtraUsage)
+	}
+}
+
+// liveUsageResponseBody mirrors, key for key, a response captured live from
+// the usage endpoint on 2026-07-01 — the full current shape: dollar fields on
+// windows, the nimbus_quill/cinder_cove/amber_ladder placeholder windows, the
+// extra_usage decimal_places/daily/weekly additions, the limits[] array with a
+// model-scoped entry, and the spend object. Utilization values and timestamps
+// are synthetic; only the shape is real.
+const liveUsageResponseBody = `{
+  "five_hour": {"utilization": 47.0, "resets_at": "2026-07-02T03:00:00.000001+00:00", "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+  "seven_day": {"utilization": 9.0, "resets_at": "2026-07-03T01:00:00.000001+00:00", "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_cowork": null,
+  "seven_day_omelette": null,
+  "tangelo": null,
+  "iguana_necktie": null,
+  "omelette_promotional": null,
+  "nimbus_quill": null,
+  "cinder_cove": null,
+  "amber_ladder": null,
+  "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null, "currency": null, "decimal_places": null, "disabled_reason": null, "daily": null, "weekly": null},
+  "limits": [
+    {"kind": "session", "group": "session", "percent": 47, "severity": "normal", "resets_at": "2026-07-02T03:00:00.000001+00:00", "scope": null, "is_active": true},
+    {"kind": "weekly_all", "group": "weekly", "percent": 9, "severity": "normal", "resets_at": "2026-07-03T01:00:00.000001+00:00", "scope": null, "is_active": false},
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 12, "severity": "normal", "resets_at": "2026-07-03T01:00:00.000002+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+  ],
+  "spend": {
+    "used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+    "limit": null,
+    "percent": 0,
+    "severity": "normal",
+    "enabled": false,
+    "disabled_reason": null,
+    "cap": null,
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)",
+    "can_purchase_credits": false,
+    "can_toggle": false
+  },
+  "member_dashboard_available": false
+}`
+
+// liveFixtureBody returns the full-shape usage response body shared by the
+// parse and display tests.
+func liveFixtureBody(t *testing.T) []byte {
+	t.Helper()
+	return []byte(liveUsageResponseBody)
+}
+
+// The live 2026-07-01 fixture exercises the full current response shape:
+// dollar fields on windows, the nimbus_quill/amber_ladder placeholders, the
+// extra_usage decimal_places/daily/weekly additions, the limits[] array
+// (including a model-scoped entry), and the spend object.
+func TestGetUsageLimits_LiveFixture_AllFieldsParsed(t *testing.T) {
+	body := liveFixtureBody(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	limits, err := newTestClient(srv.URL, "test-org").GetUsageLimits()
+	if err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	// five_hour: utilization 47, all three dollar fields nil.
+	if limits.FiveHour == nil || roundUtilization(limits.FiveHour.Utilization) != 47 {
+		t.Errorf("FiveHour = %+v, want utilization 47", limits.FiveHour)
+	}
+	if limits.FiveHour != nil && (limits.FiveHour.LimitDollars != nil ||
+		limits.FiveHour.UsedDollars != nil || limits.FiveHour.RemainingDollars != nil) {
+		t.Errorf("FiveHour dollar fields should be nil: %+v", limits.FiveHour)
+	}
+	if limits.FiveHour.ResetsAtTime.IsZero() {
+		t.Error("FiveHour.ResetsAtTime was not parsed")
+	}
+	if limits.SevenDay == nil || limits.SevenDay.ResetsAtTime.IsZero() {
+		t.Error("SevenDay.ResetsAtTime was not parsed")
+	}
+
+	// All null windows, including the new placeholders, unmarshal to nil.
+	if limits.SevenDayOAuthApps != nil || limits.SevenDayOpus != nil ||
+		limits.SevenDaySonnet != nil || limits.SevenDayCowork != nil ||
+		limits.SevenDayOmelette != nil || limits.Tangelo != nil ||
+		limits.IguanaNecktie != nil || limits.OmelettePromotional != nil ||
+		limits.CinderCove != nil || limits.NimbusQuill != nil || limits.AmberLadder != nil {
+		t.Error("null windows (including nimbus_quill, amber_ladder, cinder_cove) should unmarshal to nil")
+	}
+
+	// extra_usage: disabled, decimal_places nil.
+	if limits.ExtraUsage == nil {
+		t.Fatal("ExtraUsage should be present")
+	}
+	if limits.ExtraUsage.IsEnabled {
+		t.Error("ExtraUsage.IsEnabled = true, want false")
+	}
+	if limits.ExtraUsage.DecimalPlaces != nil {
+		t.Errorf("ExtraUsage.DecimalPlaces = %v, want nil", *limits.ExtraUsage.DecimalPlaces)
+	}
+
+	// limits[]: 3 entries, kinds session/weekly_all/weekly_scoped.
+	if len(limits.Limits) != 3 {
+		t.Fatalf("len(Limits) = %d, want 3", len(limits.Limits))
+	}
+	wantKinds := []string{"session", "weekly_all", "weekly_scoped"}
+	for i, want := range wantKinds {
+		if limits.Limits[i].Kind != want {
+			t.Errorf("Limits[%d].Kind = %q, want %q", i, limits.Limits[i].Kind, want)
+		}
+		if limits.Limits[i].ResetsAtTime.IsZero() {
+			t.Errorf("Limits[%d].ResetsAtTime was not parsed", i)
+		}
+	}
+
+	scoped := limits.Limits[2]
+	if roundUtilization(scoped.Percent) != 12 {
+		t.Errorf("weekly_scoped Percent = %v, want 12", scoped.Percent)
+	}
+	if scoped.Severity != "normal" {
+		t.Errorf("weekly_scoped Severity = %q, want %q", scoped.Severity, "normal")
+	}
+	if scoped.IsActive {
+		t.Error("weekly_scoped IsActive = true, want false")
+	}
+	if scoped.Scope == nil || scoped.Scope.Model == nil {
+		t.Fatal("weekly_scoped Scope.Model should be present")
+	}
+	if scoped.Scope.Model.DisplayName == nil || *scoped.Scope.Model.DisplayName != "Fable" {
+		t.Errorf("weekly_scoped Scope.Model.DisplayName = %v, want \"Fable\"", scoped.Scope.Model.DisplayName)
+	}
+	if scoped.Scope.Model.ID != nil {
+		t.Errorf("weekly_scoped Scope.Model.ID = %v, want nil", *scoped.Scope.Model.ID)
+	}
+
+	// spend: parsed, disabled.
+	if limits.Spend == nil {
+		t.Fatal("Spend should be present")
+	}
+	if limits.Spend.Enabled {
+		t.Error("Spend.Enabled = true, want false")
+	}
+	if limits.Spend.Percent != 0 {
+		t.Errorf("Spend.Percent = %v, want 0", limits.Spend.Percent)
+	}
+	if limits.Spend.Used == nil {
+		t.Fatal("Spend.Used should be present")
+	}
+	if limits.Spend.Used.AmountMinor != 0 {
+		t.Errorf("Spend.Used.AmountMinor = %d, want 0", limits.Spend.Used.AmountMinor)
+	}
+	if limits.Spend.Used.Currency != "USD" {
+		t.Errorf("Spend.Used.Currency = %q, want %q", limits.Spend.Used.Currency, "USD")
+	}
+	if limits.Spend.Used.Exponent != 2 {
+		t.Errorf("Spend.Used.Exponent = %d, want 2", limits.Spend.Used.Exponent)
+	}
+	if limits.Spend.CanPurchaseCredits {
+		t.Error("Spend.CanPurchaseCredits = true, want false")
+	}
+
+	if limits.MemberDashboardAvailable {
+		t.Error("MemberDashboardAvailable = true, want false")
+	}
+}
+
+// unknownTopLevelKeys mirrors the drift check performed inside GetUsageLimits
+// so it can be exercised directly against arbitrary bodies.
+func unknownTopLevelKeys(body []byte) []string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	var unknown []string
+	for key := range raw {
+		if !usageResponseKnownKeys[key] {
+			unknown = append(unknown, key)
+		}
+	}
+	return unknown
+}
+
+func TestUnknownTopLevelKeys_DetectsInjectedKey(t *testing.T) {
+	body := []byte(`{"five_hour":{"utilization":1},"zebra_lantern":"surprise"}`)
+	got := unknownTopLevelKeys(body)
+	if len(got) != 1 || got[0] != "zebra_lantern" {
+		t.Errorf("unknownTopLevelKeys = %v, want [\"zebra_lantern\"]", got)
+	}
+}
+
+func TestUnknownTopLevelKeys_LiveFixtureHasNone(t *testing.T) {
+	body := liveFixtureBody(t)
+	if got := unknownTopLevelKeys(body); len(got) != 0 {
+		t.Errorf("unknownTopLevelKeys(live fixture) = %v, want none", got)
 	}
 }
 

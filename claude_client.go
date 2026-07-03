@@ -41,28 +41,62 @@ type ClaudeUsageClient struct {
 	baseURL        string
 }
 
+// usageResponseKnownKeys lists every top-level key the usage endpoint is known
+// to return. It must be updated in the same change that adds struct fields to
+// UsageLimits, so the drift check in GetUsageLimits stays accurate. It only
+// detects new top-level keys — drift nested inside extra_usage, spend, or any
+// window object is not detected.
+var usageResponseKnownKeys = map[string]bool{
+	"five_hour":                  true,
+	"seven_day":                  true,
+	"seven_day_oauth_apps":       true,
+	"seven_day_opus":             true,
+	"seven_day_sonnet":           true,
+	"seven_day_cowork":           true,
+	"seven_day_omelette":         true,
+	"tangelo":                    true,
+	"iguana_necktie":             true,
+	"omelette_promotional":       true,
+	"nimbus_quill":               true,
+	"cinder_cove":                true,
+	"amber_ladder":               true,
+	"extra_usage":                true,
+	"limits":                     true,
+	"spend":                      true,
+	"member_dashboard_available": true,
+}
+
 // UsageLimits mirrors the claude.ai/api/organizations/{org_id}/usage response.
 // Every field the endpoint returns is represented here in API response order so
 // the response is captured in full; windows the account does not use arrive as
 // null and unmarshal to nil pointers.
 type UsageLimits struct {
-	FiveHour            *UsageLimit     `json:"five_hour,omitempty"`
-	SevenDay            *UsageLimit     `json:"seven_day,omitempty"`
-	SevenDayOAuthApps   *UsageLimit     `json:"seven_day_oauth_apps,omitempty"`
-	SevenDayOpus        *UsageLimit     `json:"seven_day_opus,omitempty"`
-	SevenDaySonnet      *UsageLimit     `json:"seven_day_sonnet,omitempty"`
-	SevenDayCowork      *UsageLimit     `json:"seven_day_cowork,omitempty"`
-	SevenDayOmelette    *UsageLimit     `json:"seven_day_omelette,omitempty"`
-	Tangelo             *UsageLimit     `json:"tangelo,omitempty"`
-	IguanaNecktie       *UsageLimit     `json:"iguana_necktie,omitempty"`
-	OmelettePromotional *UsageLimit     `json:"omelette_promotional,omitempty"`
-	ExtraUsage          *ExtraUsageInfo `json:"extra_usage,omitempty"`
+	FiveHour                 *UsageLimit     `json:"five_hour,omitempty"`
+	SevenDay                 *UsageLimit     `json:"seven_day,omitempty"`
+	SevenDayOAuthApps        *UsageLimit     `json:"seven_day_oauth_apps,omitempty"`
+	SevenDayOpus             *UsageLimit     `json:"seven_day_opus,omitempty"`
+	SevenDaySonnet           *UsageLimit     `json:"seven_day_sonnet,omitempty"`
+	SevenDayCowork           *UsageLimit     `json:"seven_day_cowork,omitempty"`
+	SevenDayOmelette         *UsageLimit     `json:"seven_day_omelette,omitempty"`
+	Tangelo                  *UsageLimit     `json:"tangelo,omitempty"`
+	IguanaNecktie            *UsageLimit     `json:"iguana_necktie,omitempty"`
+	OmelettePromotional      *UsageLimit     `json:"omelette_promotional,omitempty"`
+	NimbusQuill              *UsageLimit     `json:"nimbus_quill,omitempty"`
+	CinderCove               *UsageLimit     `json:"cinder_cove,omitempty"`
+	AmberLadder              *UsageLimit     `json:"amber_ladder,omitempty"`
+	ExtraUsage               *ExtraUsageInfo `json:"extra_usage,omitempty"`
+	Limits                   []LimitEntry    `json:"limits,omitempty"`
+	Spend                    *SpendInfo      `json:"spend,omitempty"`
+	MemberDashboardAvailable bool            `json:"member_dashboard_available"`
 }
 
 type UsageLimit struct {
-	Utilization  float64   `json:"utilization"`
-	ResetsAt     *string   `json:"resets_at"`
-	ResetsAtTime time.Time `json:"-"`
+	Utilization      float64   `json:"utilization"`
+	ResetsAt         *string   `json:"resets_at"`
+	ResetsAtTime     time.Time `json:"-"`
+	LimitDollars     *float64  `json:"limit_dollars"`
+	UsedDollars      *float64  `json:"used_dollars"`
+	RemainingDollars *float64  `json:"remaining_dollars"`
 }
 
 // ExtraUsageInfo mirrors the extra_usage object — pay-as-you-go credit state.
@@ -74,6 +108,63 @@ type ExtraUsageInfo struct {
 	Utilization    *float64 `json:"utilization"`
 	Currency       *string  `json:"currency"`
 	DisabledReason *string  `json:"disabled_reason"`
+	DecimalPlaces  *int     `json:"decimal_places"`
+	// Daily and Weekly are captured losslessly as raw JSON because their shape
+	// is unknowable while they arrive as null — no observed non-null sample to
+	// model a struct from.
+	Daily  json.RawMessage `json:"daily"`
+	Weekly json.RawMessage `json:"weekly"`
+}
+
+// LimitEntry is one entry in the limits[] array — a flattened, display-ready
+// view of a usage window (session, weekly, or a model/surface-scoped weekly
+// slice), separate from the legacy named windows above.
+type LimitEntry struct {
+	Kind         string      `json:"kind"`
+	Group        string      `json:"group"`
+	Percent      float64     `json:"percent"`
+	Severity     string      `json:"severity"`
+	ResetsAt     *string     `json:"resets_at"`
+	ResetsAtTime time.Time   `json:"-"`
+	Scope        *LimitScope `json:"scope"`
+	IsActive     bool        `json:"is_active"`
+}
+
+// LimitScope narrows a LimitEntry to a specific model and/or surface. Surface
+// is captured as raw JSON because it is only observed as null so far.
+type LimitScope struct {
+	Model   *LimitScopeModel `json:"model"`
+	Surface json.RawMessage  `json:"surface"`
+}
+
+type LimitScopeModel struct {
+	ID          *string `json:"id"`
+	DisplayName *string `json:"display_name"`
+}
+
+// SpendInfo mirrors the spend object — pay-as-you-go dollar spend tracking,
+// distinct from the credit-based ExtraUsageInfo. Limit, Cap, Balance and
+// AutoReload are captured as raw JSON because they are only observed as null
+// so far and their populated shape is unknown.
+type SpendInfo struct {
+	Used               *SpendUsed      `json:"used"`
+	Limit              json.RawMessage `json:"limit"`
+	Percent            float64         `json:"percent"`
+	Severity           string          `json:"severity"`
+	Enabled            bool            `json:"enabled"`
+	DisabledReason     *string         `json:"disabled_reason"`
+	Cap                json.RawMessage `json:"cap"`
+	Balance            json.RawMessage `json:"balance"`
+	AutoReload         json.RawMessage `json:"auto_reload"`
+	Disclaimer         *string         `json:"disclaimer"`
+	CanPurchaseCredits bool            `json:"can_purchase_credits"`
+	CanToggle          bool            `json:"can_toggle"`
+}
+
+type SpendUsed struct {
+	AmountMinor int64  `json:"amount_minor"`
+	Currency    string `json:"currency"`
+	Exponent    int    `json:"exponent"`
 }
 
 func newHTTPClient() *http.Client {
@@ -246,6 +337,31 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 	parseResetTime(limits.Tangelo)
 	parseResetTime(limits.IguanaNecktie)
 	parseResetTime(limits.OmelettePromotional)
+	parseResetTime(limits.NimbusQuill)
+	parseResetTime(limits.CinderCove)
+	parseResetTime(limits.AmberLadder)
+
+	for i := range limits.Limits {
+		entry := &limits.Limits[i]
+		if entry.ResetsAt != nil && *entry.ResetsAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, *entry.ResetsAt); err == nil && !t.IsZero() {
+				entry.ResetsAtTime = t
+			}
+		}
+	}
+
+	// Drift alarm: a second, lossless unmarshal into raw top-level keys lets us
+	// detect a new field the API started returning before it silently vanishes
+	// into an unparsed response. This only catches new top-level keys — drift
+	// nested inside extra_usage, spend, or a window object is not detected.
+	var rawTopLevel map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawTopLevel); err == nil {
+		for key := range rawTopLevel {
+			if !usageResponseKnownKeys[key] {
+				log.Printf("usage response contains unknown top-level key %q — struct fields may need updating", key)
+			}
+		}
+	}
 
 	return &limits, nil
 }

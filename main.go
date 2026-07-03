@@ -83,6 +83,9 @@ var indicators = []indicator{
 	{"tangelo", "Tangelo", func(u *UsageLimits) *UsageLimit { return u.Tangelo }},
 	{"iguanaNecktie", "Iguana Necktie", func(u *UsageLimits) *UsageLimit { return u.IguanaNecktie }},
 	{"designPromotional", "Design (Promotional)", func(u *UsageLimits) *UsageLimit { return u.OmelettePromotional }},
+	{"nimbusQuill", "Nimbus Quill", func(u *UsageLimits) *UsageLimit { return u.NimbusQuill }},
+	{"cinderCove", "Cinder Cove", func(u *UsageLimits) *UsageLimit { return u.CinderCove }},
+	{"amberLadder", "Amber Ladder", func(u *UsageLimits) *UsageLimit { return u.AmberLadder }},
 	{"extraUsage", "Extra Usage", extraUsageWindow},
 }
 
@@ -247,6 +250,38 @@ func getSelectedLimit(limits *UsageLimits, indicatorKey string) *UsageLimit {
 	return findIndicator(indicatorKey).get(limits)
 }
 
+// scopedLimitLabel builds the console label for a model/surface-scoped
+// limits[] entry, e.g. "Weekly (Fable)". It prefers the model display name,
+// falls back to the model ID, and finally to a generic "Scoped" label when
+// neither is present.
+func scopedLimitLabel(entry LimitEntry) string {
+	if entry.Scope != nil && entry.Scope.Model != nil {
+		if entry.Scope.Model.DisplayName != nil {
+			return fmt.Sprintf("Weekly (%s)", *entry.Scope.Model.DisplayName)
+		}
+		if entry.Scope.Model.ID != nil {
+			return fmt.Sprintf("Weekly (%s)", *entry.Scope.Model.ID)
+		}
+	}
+	return "Weekly (Scoped)"
+}
+
+// scopedLimitToUsageLimit adapts a limits[] entry to the UsageLimit shape so
+// it can be rendered with the existing formatConsoleUsage helper.
+func scopedLimitToUsageLimit(entry LimitEntry) *UsageLimit {
+	return &UsageLimit{
+		Utilization:  entry.Percent,
+		ResetsAt:     entry.ResetsAt,
+		ResetsAtTime: entry.ResetsAtTime,
+	}
+}
+
+// formatScopedLimitLine renders one model/surface-scoped limits[] entry as a
+// console line, in the same format as formatConsoleUsage.
+func formatScopedLimitLine(entry LimitEntry) string {
+	return formatConsoleUsage(scopedLimitToUsageLimit(entry), scopedLimitLabel(entry)+":", "")
+}
+
 // Helper function to display usage stats. Windows with no data are skipped to
 // match the menu, except the 5-hour session, which is always shown as the
 // headline metric.
@@ -263,6 +298,18 @@ func displayUsageStats(limits *UsageLimits) {
 			noSessionMsg = "no active session"
 		}
 		fmt.Print(formatConsoleUsage(limit, indicators[i].label+":", noSessionMsg))
+	}
+	// Scoped limits (e.g. a weekly window narrowed to one model) are display
+	// only — they are not selectable indicators and never touch config
+	// validation or persistence. Unscoped entries (session, weekly_all) merely
+	// duplicate five_hour/seven_day already shown above, so only scoped
+	// entries are printed here.
+	if limits != nil {
+		for _, entry := range limits.Limits {
+			if entry.Scope != nil {
+				fmt.Print(formatScopedLimitLine(entry))
+			}
+		}
 	}
 	fmt.Println()
 }

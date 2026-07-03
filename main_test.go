@@ -175,6 +175,40 @@ func TestGetSelectedLimitRouting(t *testing.T) {
 	}
 }
 
+// The scoped-limit display path must label a model-scoped weekly entry with
+// its display name and show its percent, for the live fixture's Fable window.
+func TestFormatScopedLimitLine_ModelScoped(t *testing.T) {
+	body := liveFixtureBody(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	limits, err := newTestClient(srv.URL, "test-org").GetUsageLimits()
+	if err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	var scopedLines []string
+	for _, entry := range limits.Limits {
+		if entry.Scope != nil {
+			scopedLines = append(scopedLines, formatScopedLimitLine(entry))
+		}
+	}
+	if len(scopedLines) != 1 {
+		t.Fatalf("got %d scoped lines, want 1: %v", len(scopedLines), scopedLines)
+	}
+	line := scopedLines[0]
+	if !strings.Contains(line, "Fable") {
+		t.Errorf("scoped line %q does not contain %q", line, "Fable")
+	}
+	if !strings.Contains(line, "12%") {
+		t.Errorf("scoped line %q does not contain %q", line, "12%")
+	}
+}
+
 // extra_usage only adapts to a window once pay-as-you-go is reporting a
 // utilization; otherwise it reports nothing (nil -> "--" in the menu).
 func TestExtraUsageWindow(t *testing.T) {
