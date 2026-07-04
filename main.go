@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,7 +20,8 @@ import (
 )
 
 const (
-	refreshInterval    = 30 * time.Second
+	refreshInterval    = 60 * time.Second  // base poll interval; 30s was too aggressive for oauth/usage (persistent 429)
+	maxBackoffInterval = 300 * time.Second // cap when the endpoint rate-limits us (429)
 	pidCheckTimeout    = 500 * time.Millisecond
 	pidFilePermissions = 0644 // Owner read/write, others read
 	logFilePermissions = 0600 // Owner read/write only (may contain error bodies)
@@ -52,9 +54,11 @@ var (
 	lastLimits  *UsageLimits
 	limitsMutex sync.RWMutex
 
-	// Consecutive error tracking for transient error resilience
-	consecutiveErrors int
-	consecutiveMutex  sync.Mutex
+	// Consecutive error tracking for transient error resilience. Both counters
+	// are guarded by consecutiveMutex.
+	consecutiveErrors     int
+	consecutiveRateLimits int
+	consecutiveMutex      sync.Mutex
 
 	// Context for graceful shutdown
 	appCtx    context.Context
@@ -876,7 +880,7 @@ func applyIndicatorMenu(limits *UsageLimits) {
 }
 
 // maxTransientErrors is the number of consecutive transient failures tolerated
-// before showing an error in the menu bar. At 30s intervals, 3 = ~1.5 minutes.
+// before showing an error in the menu bar. At 60s intervals, 3 = ~3 minutes.
 const maxTransientErrors = 3
 
 // updateAction is how the menu bar should react to a failed usage fetch.
@@ -900,6 +904,51 @@ func classifyUpdate(err error, consecutiveCount int) updateAction {
 	return actionShowError
 }
 
+// haveLastLimits reports whether a previous successful fetch is cached, so a
+// rate-limited poll can serve stale data instead of falling through to the
+// error state.
+func haveLastLimits() bool {
+	limitsMutex.RLock()
+	defer limitsMutex.RUnlock()
+	return lastLimits != nil
+}
+
+// nextPollDelay returns the base interval normally, and on consecutive
+// rate-limited (429) polls backs off exponentially from base toward max.
+// rateLimitFailures is the count of consecutive 429s including this one
+// (0 = not rate-limited). A usable server Retry-After (>0) overrides only
+// upward — we never poll sooner than told.
+func nextPollDelay(base, max time.Duration, rateLimitFailures int, retryAfter time.Duration) time.Duration {
+	if rateLimitFailures <= 0 {
+		return base
+	}
+	d := base
+	for i := 1; i < rateLimitFailures && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	if retryAfter > d {
+		d = retryAfter
+	}
+	return d
+}
+
+// pollJitterFraction is how far withJitter may spread a delay, as a fraction
+// of the delay itself (0.10 = ±10%).
+const pollJitterFraction = 0.10
+
+// withJitter spreads a delay by ±10% so many monitors (and Claude Code's own
+// usage polls, which share the same rate-limit budget) don't beat in lockstep.
+func withJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	delta := (rand.Float64()*2 - 1) * pollJitterFraction * float64(d)
+	return d + time.Duration(delta)
+}
+
 // refreshTrigger asks the update worker to fetch now. Sends coalesce, so rapid
 // refresh requests do not pile up.
 var refreshTrigger = make(chan struct{}, 1)
@@ -913,28 +962,44 @@ func requestRefresh() {
 
 // runUpdateWorker is the single goroutine that fetches usage data — on a timer
 // and on demand. Confining fetches to one goroutine means updateStats never
-// runs concurrently with itself.
+// runs concurrently with itself. The timer is rescheduled after every fetch
+// using the delay updateStats returns — the base interval normally, backed
+// off further while the endpoint is rate-limiting us — with jitter applied so
+// this monitor does not beat in lockstep with others polling the same
+// endpoint.
 func runUpdateWorker(ctx context.Context) {
-	ticker := time.NewTicker(refreshInterval)
-	defer ticker.Stop()
+	delay := updateStats() // initial fetch
+	timer := time.NewTimer(withJitter(delay))
+	defer timer.Stop()
 
-	updateStats() // initial fetch
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			updateStats()
+		case <-timer.C:
+			delay = updateStats()
+			timer.Reset(withJitter(delay))
 		case <-refreshTrigger:
-			updateStats()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			delay = updateStats()
+			timer.Reset(withJitter(delay))
 		}
 	}
 }
 
-func updateStats() {
+// updateStats fetches usage data once and updates the menu bar accordingly.
+// It returns the next base poll delay (pre-jitter): refreshInterval on
+// success or on a non-rate-limit error, or a value backed off toward
+// maxBackoffInterval while the endpoint keeps returning 429.
+func updateStats() time.Duration {
 	if claudeClient == nil {
 		systray.SetTitle("⚪ Error")
-		return
+		return refreshInterval
 	}
 
 	limits, err := claudeClient.GetUsageLimits()
@@ -948,14 +1013,35 @@ func updateStats() {
 		limits, err = claudeClient.GetUsageLimits()
 	}
 	if err != nil {
+		var rl *RateLimitError
+		isRateLimit := errors.As(err, &rl)
+
 		consecutiveMutex.Lock()
 		consecutiveErrors++
 		count := consecutiveErrors
+		var delay time.Duration
+		if isRateLimit {
+			consecutiveRateLimits++
+			delay = nextPollDelay(refreshInterval, maxBackoffInterval, consecutiveRateLimits, rl.RetryAfter)
+		} else {
+			consecutiveRateLimits = 0
+			delay = refreshInterval
+		}
 		consecutiveMutex.Unlock()
+
+		action := classifyUpdate(err, count)
+		// A logged-in user being rate-limited should keep seeing their
+		// last-good numbers, not "Error loading data" — but only once there is
+		// stale data to show. A cold start with no cache yet still falls
+		// through to actionShowError, and a real auth failure (actionShowAuth)
+		// is never downgraded.
+		if action == actionShowError && errors.Is(err, ErrTransient) && haveLastLimits() {
+			action = actionKeepStale
+		}
 
 		// The error message goes on the first item, which must be visible even
 		// if auto-hide had hidden it (e.g. the 5-hour window had no data).
-		switch classifyUpdate(err, count) {
+		switch action {
 		case actionShowAuth:
 			indicatorMenuItems[0].Show()
 			indicatorMenuItems[0].SetTitle("Session expired - please login again")
@@ -968,12 +1054,13 @@ func updateStats() {
 			indicatorMenuItems[0].Show()
 			indicatorMenuItems[0].SetTitle("Error loading data")
 		}
-		return
+		return delay
 	}
 
-	// Success — reset error counter
+	// Success — reset both error counters
 	consecutiveMutex.Lock()
 	consecutiveErrors = 0
+	consecutiveRateLimits = 0
 	consecutiveMutex.Unlock()
 
 	// Refresh every indicator's title and hide the ones with no data.
@@ -986,6 +1073,8 @@ func updateStats() {
 
 	// Update menu bar display
 	updateMenuBarDisplay(limits)
+
+	return refreshInterval
 }
 
 func onExit() {

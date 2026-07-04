@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,6 +33,44 @@ var (
 	ErrSessionExpired = errors.New("session expired")
 	ErrTransient      = errors.New("transient error")
 )
+
+// RateLimitError is a transient error carrying the server's Retry-After hint
+// (0 when absent or unusable). It satisfies errors.Is(err, ErrTransient) so
+// existing transient handling still applies.
+type RateLimitError struct {
+	RetryAfter time.Duration
+	StatusCode int
+	Body       string
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("rate limited (status %d): %s", e.StatusCode, e.Body)
+}
+
+func (e *RateLimitError) Is(target error) bool { return target == ErrTransient }
+
+// parseRetryAfter parses a Retry-After header value — either delta-seconds
+// ("120") or an HTTP-date — into a duration. An absent, unparseable, zero,
+// negative, or already-past value all mean "no usable server hint": it never
+// returns a negative duration.
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
 
 // Shared HTTP client for connection pooling
 var sharedHTTPClient = newHTTPClient()
@@ -288,10 +327,12 @@ func (c *ClaudeUsageClient) doAPIRequest(ctx context.Context, apiURL string) (*h
 }
 
 // isTransientStatus returns true for HTTP status codes that indicate a
-// temporary problem (server error, rate limit, Cloudflare challenge).
+// temporary problem (server error, Cloudflare challenge). 429 is deliberately
+// NOT included here — it is intercepted earlier in GetUsageLimits and
+// returned as a *RateLimitError so its Retry-After hint and consecutive-429
+// count can drive polling backoff instead of the flat transient-error count.
 func isTransientStatus(code int) bool {
 	return code == http.StatusRequestTimeout || // 408
-		code == http.StatusTooManyRequests || // 429
 		code >= 500
 }
 
@@ -348,6 +389,18 @@ func (c *ClaudeUsageClient) GetUsageLimits() (*UsageLimits, error) {
 			return nil, fmt.Errorf("%w: cloudflare challenge (status 403)", ErrTransient)
 		}
 		return nil, fmt.Errorf("%w (status %d)", ErrAuthFailed, resp.StatusCode)
+	}
+
+	// 429 carries its own Retry-After hint, so it is classified before the
+	// generic transient-status check and returned as a typed error the caller
+	// can use to drive exponential backoff.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, &RateLimitError{
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(body)),
+		}
 	}
 
 	if isTransientStatus(resp.StatusCode) {

@@ -7,6 +7,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // newTestClient builds a client pointed at a test server. It is given its own
@@ -415,16 +416,114 @@ func TestNewOAuthUsageClient_ProviderError_WrapsErrAuthFailedWithoutRequest(t *t
 }
 
 func TestIsTransientStatus(t *testing.T) {
-	transient := []int{408, 429, 500, 502, 503, 504}
+	transient := []int{408, 500, 502, 503, 504}
 	for _, code := range transient {
 		if !isTransientStatus(code) {
 			t.Errorf("status %d should be transient", code)
 		}
 	}
-	notTransient := []int{200, 400, 401, 403, 404}
+	// 429 is deliberately excluded: it is intercepted earlier in
+	// GetUsageLimits and returned as a *RateLimitError instead, so it must not
+	// also be reported as a generic transient status here.
+	notTransient := []int{200, 400, 401, 403, 404, 429}
 	for _, code := range notTransient {
 		if isTransientStatus(code) {
 			t.Errorf("status %d should not be transient", code)
 		}
+	}
+}
+
+// parseRetryAfter must accept delta-seconds and HTTP-date forms, and must
+// never return a negative duration for an absent, malformed, zero, negative,
+// or already-past value.
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{"empty", "", 0},
+		{"zero seconds", "0", 0},
+		{"negative seconds", "-5", 0},
+		{"positive seconds", "7", 7 * time.Second},
+		{"padded with whitespace", "  10  ", 10 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := parseRetryAfter(tc.in); got != tc.want {
+			t.Errorf("%s: parseRetryAfter(%q) = %v, want %v", tc.name, tc.in, got, tc.want)
+		}
+	}
+
+	future := time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(future); got <= 0 {
+		t.Errorf("parseRetryAfter(future HTTP-date %q) = %v, want > 0", future, got)
+	}
+
+	past := time.Now().Add(-2 * time.Hour).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(past); got != 0 {
+		t.Errorf("parseRetryAfter(past HTTP-date %q) = %v, want 0", past, got)
+	}
+}
+
+// RateLimitError must satisfy errors.Is(err, ErrTransient) so it flows through
+// existing transient handling (classifyUpdate, the 3-strike tolerance), while
+// remaining distinct from a real auth failure.
+func TestRateLimitErrorIsTransient(t *testing.T) {
+	err := &RateLimitError{StatusCode: 429, Body: "rate limited"}
+	if !errors.Is(err, ErrTransient) {
+		t.Error("errors.Is(RateLimitError, ErrTransient) = false, want true")
+	}
+	if errors.Is(err, ErrAuthFailed) {
+		t.Error("errors.Is(RateLimitError, ErrAuthFailed) = true, want false")
+	}
+}
+
+// A live 429 response must come back as a *RateLimitError carrying the
+// parsed Retry-After hint, not a generic ErrTransient string, so the caller
+// can drive backoff off it.
+func TestGetUsageLimits_429_ReturnsRateLimitErrorWithRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("slow down"))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "test-org")
+	_, err := c.GetUsageLimits()
+
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("expected *RateLimitError, got: %v (%T)", err, err)
+	}
+	if rl.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("RateLimitError.StatusCode = %d, want %d", rl.StatusCode, http.StatusTooManyRequests)
+	}
+	if rl.RetryAfter != 42*time.Second {
+		t.Errorf("RateLimitError.RetryAfter = %v, want %v", rl.RetryAfter, 42*time.Second)
+	}
+	if !errors.Is(err, ErrTransient) {
+		t.Error("expected a 429 error to satisfy errors.Is(err, ErrTransient)")
+	}
+}
+
+// A 429 with no (or an unusable) Retry-After header must still classify as a
+// RateLimitError, just with RetryAfter == 0 — the caller's own backoff curve
+// takes over instead of a server hint.
+func TestGetUsageLimits_429_NoRetryAfter_ZeroHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "test-org")
+	_, err := c.GetUsageLimits()
+
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("expected *RateLimitError, got: %v (%T)", err, err)
+	}
+	if rl.RetryAfter != 0 {
+		t.Errorf("RateLimitError.RetryAfter = %v, want 0", rl.RetryAfter)
 	}
 }
