@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -50,9 +51,27 @@ var (
 	// read by the update worker.
 	indicatorMutex sync.RWMutex
 
-	// Last fetched limits for instant display switching (protected by mutex)
-	lastLimits  *UsageLimits
-	limitsMutex sync.RWMutex
+	// Last fetched limits for instant display switching, and when they were
+	// fetched — the timestamp feeds the multi-profile menu's "(as of ...)"
+	// staleness marker when the active profile itself goes stale (ISC-89).
+	// lastLimitsProfile records which profile these globals belong to
+	// (captured in updateStats from the active profile at fetch time — see
+	// the comment there). CurrentOAuthToken/activeProfileDir() already
+	// re-resolve the active profile fresh on every call, so the active
+	// poller itself always fetches the right profile's data (ISC-42/53/54)
+	// — but a `profile switch` made via the CLI is a separate process, so it
+	// never fires requestRefresh, and the daemon's active poller only
+	// notices on its own next tick (up to refreshInterval later). Until
+	// then these globals still hold the PREVIOUS active profile's numbers.
+	// profileSnapshotFunc compares lastLimitsProfile against the current
+	// active name so the multi-profile menu never attributes a stale,
+	// wrong-account fetch to the newly-active profile's row (ISC-89
+	// regression, caught in adversarial review). All three fields are
+	// protected by limitsMutex.
+	lastLimits        *UsageLimits
+	lastLimitsAt      time.Time
+	lastLimitsProfile string
+	limitsMutex       sync.RWMutex
 
 	// Consecutive error tracking for transient error resilience. Both counters
 	// are guarded by consecutiveMutex.
@@ -368,6 +387,823 @@ func migrateStripLegacySecrets() {
 	}
 }
 
+// ============================================================================
+// Multi-profile support (F5-F8): per-profile polling, per-profile menu
+// sections, per-profile terminal status, and the CLI surface (`profile ...`).
+//
+// Design note: the ACTIVE profile keeps using the pre-existing single-profile
+// machinery above (claudeClient, lastLimits, consecutiveErrors, updateStats,
+// runUpdateWorker) completely unmodified in its polling logic — it already
+// tracks the active profile automatically, because CurrentOAuthToken /
+// CurrentOAuthTokenForDir(activeProfileDir()) re-resolve the active profile's
+// config dir fresh from disk on every call (see credentials.go, profiles.go).
+// That is what keeps ISC-42/53/54 true for free: with <=1 profile configured,
+// or for whichever profile is active, nothing here changes existing behavior.
+//
+// Everything below is an ADDITIONAL layer that polls every OTHER (non-active)
+// profile independently, and renders a per-profile menu/terminal section once
+// more than one profile is registered.
+// ============================================================================
+
+// profileState is one non-active profile's independent poll state: its own
+// OAuth client (token resolved per-dir, never the active profile's), its own
+// cached usage data, and its own error/backoff counters — a failure here can
+// never block or delay another profile's poll (ISC-36, 39, 40).
+type profileState struct {
+	meta   ProfileMeta
+	client *ClaudeUsageClient
+
+	mu                    sync.RWMutex
+	lastLimits            *UsageLimits
+	lastGoodAt            time.Time
+	frozen                bool // true once a poll fails while lastLimits is still cached (ISC-85)
+	consecutiveErrors     int
+	consecutiveRateLimits int
+}
+
+var (
+	profileStatesMu sync.RWMutex
+	profileStates   = make(map[string]*profileState)
+)
+
+func setProfileState(name string, s *profileState) {
+	profileStatesMu.Lock()
+	profileStates[name] = s
+	profileStatesMu.Unlock()
+}
+
+func removeProfileState(name string) {
+	profileStatesMu.Lock()
+	delete(profileStates, name)
+	profileStatesMu.Unlock()
+}
+
+func getProfileState(name string) (*profileState, bool) {
+	profileStatesMu.RLock()
+	defer profileStatesMu.RUnlock()
+	s, ok := profileStates[name]
+	return s, ok
+}
+
+// profileStaggerStep is the delay between successive non-active profiles'
+// first poll, so N profiles' pollers do not all fire in the same instant
+// (ISC-37).
+const profileStaggerStep = 7 * time.Second
+
+// staggerOffsetFor returns the initial delay before the profile at index idx
+// (0-based, in registry order among non-active profiles) starts polling.
+func staggerOffsetFor(idx int) time.Duration {
+	return time.Duration(idx) * profileStaggerStep
+}
+
+// otherProfilesInOrder returns every profile in cfg OTHER than the active
+// one, preserving registry order — the set the multi-profile poller
+// supervises. The active profile is excluded: it already has its own
+// dedicated poll loop (runUpdateWorker) driving the menubar title directly
+// (ISC-53), so including it here would poll it twice. With <=1 profile
+// configured this returns nil, so the entire multi-profile layer becomes a
+// no-op (ISC-42, 54).
+func otherProfilesInOrder(cfg Config) []ProfileMeta {
+	if len(cfg.Profiles) <= 1 {
+		return nil
+	}
+	active := activeProfileName(cfg)
+	others := make([]ProfileMeta, 0, len(cfg.Profiles)-1)
+	for _, p := range cfg.Profiles {
+		if p.Name == active {
+			continue
+		}
+		others = append(others, p)
+	}
+	return others
+}
+
+// profileErrorBackoff is the retry interval for a profile whose credential is
+// expired or unreadable (ErrTransient/ErrAuthFailed from
+// CurrentOAuthTokenForDir): we already know Claude Code has not refreshed it
+// yet, so polling every refreshInterval would be spam with no chance of a
+// different answer; a slower retry still notices promptly once Claude Code
+// refreshes in the background (ISC-85).
+const profileErrorBackoff = 5 * time.Minute
+
+// pollProfileOnce fetches usage for one non-active profile and updates its
+// state, returning the next poll delay. On failure, lastLimits/lastGoodAt are
+// left untouched (frozen last-good display, ISC-85) and reset countdowns for
+// that cached data keep computing locally at display time (ISC-86) — nothing
+// extra is needed for that, since calculateTimeUntilReset/formatUsageWithReset
+// already work purely off ResetsAtTime on the cached UsageLimits.
+func pollProfileOnce(state *profileState) time.Duration {
+	limits, err := state.client.GetUsageLimits()
+	if err != nil {
+		var rl *RateLimitError
+		isRateLimit := errors.As(err, &rl)
+
+		state.mu.Lock()
+		state.consecutiveErrors++
+		if isRateLimit {
+			state.consecutiveRateLimits++
+		} else {
+			state.consecutiveRateLimits = 0
+		}
+		hadData := state.lastLimits != nil
+		state.frozen = hadData
+		rateFails := state.consecutiveRateLimits
+		state.mu.Unlock()
+
+		label := "no cached data yet"
+		if hadData {
+			label = "frozen last-good data kept"
+		}
+		log.Printf("profile %q: usage fetch failed (%s): %s", state.meta.Name, label, redactedFetchErr(err))
+
+		if isRateLimit {
+			return nextPollDelay(refreshInterval, maxBackoffInterval, rateFails, rl.RetryAfter)
+		}
+		if errors.Is(err, ErrTransient) || errors.Is(err, ErrAuthFailed) {
+			return profileErrorBackoff
+		}
+		return refreshInterval
+	}
+
+	state.mu.Lock()
+	state.lastLimits = limits
+	state.lastGoodAt = time.Now()
+	state.frozen = false
+	state.consecutiveErrors = 0
+	state.consecutiveRateLimits = 0
+	state.mu.Unlock()
+	return refreshInterval
+}
+
+// runProfilePoller is one non-active profile's independent poll loop —
+// entirely separate from the active profile's runUpdateWorker/updateStats.
+func runProfilePoller(ctx context.Context, meta ProfileMeta, stagger time.Duration) {
+	dir := meta.Dir
+	client := NewOAuthUsageClient(func() (string, error) { return CurrentOAuthTokenForDir(dir) })
+	state := &profileState{meta: meta, client: client}
+	setProfileState(meta.Name, state)
+	defer removeProfileState(meta.Name)
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(stagger):
+	}
+
+	delay := pollProfileOnce(state)
+	refreshProfileMenu()
+	timer := time.NewTimer(withJitter(delay))
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			delay = pollProfileOnce(state)
+			refreshProfileMenu()
+			timer.Reset(withJitter(delay))
+		}
+	}
+}
+
+// multiProfileSuperviseInterval is how often runMultiProfileSupervisor
+// re-reads the profile registry to start pollers for newly added profiles and
+// stop them for removed/now-active ones. It is independent of, and much
+// shorter than, refreshInterval — the 60s-per-profile poll floor (ISC-38)
+// lives in each profile's own poller, not here.
+const multiProfileSuperviseInterval = 10 * time.Second
+
+// runMultiProfileSupervisor watches the profile registry and starts/stops one
+// polling goroutine per non-active profile, so profile adds/removes and
+// active-profile switches (made via the CLI while this daemon is running,
+// ISC-49) are picked up within one supervise cycle (ISC-28, 56) without
+// restarting the daemon.
+func runMultiProfileSupervisor(ctx context.Context) {
+	cancels := make(map[string]context.CancelFunc)
+
+	reconcile := func() {
+		cfg := LoadConfig()
+		others := otherProfilesInOrder(cfg)
+
+		wanted := make(map[string]ProfileMeta, len(others))
+		for _, p := range others {
+			wanted[p.Name] = p
+		}
+		for name, cancel := range cancels {
+			if _, ok := wanted[name]; !ok {
+				cancel()
+				delete(cancels, name)
+			}
+		}
+		for i, p := range others {
+			if _, ok := cancels[p.Name]; ok {
+				continue
+			}
+			pctx, cancel := context.WithCancel(ctx)
+			cancels[p.Name] = cancel
+			go runProfilePoller(pctx, p, staggerOffsetFor(i))
+		}
+		refreshProfileMenu()
+	}
+
+	reconcile()
+
+	ticker := time.NewTicker(multiProfileSuperviseInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			for _, cancel := range cancels {
+				cancel()
+			}
+			return
+		case <-ticker.C:
+			reconcile()
+		}
+	}
+}
+
+// --- Menubar: per-profile section (F7, ISC-50..56, 89) ---------------------
+
+// maxMenuProfiles bounds the pre-created menu-item pool. getlantern/systray
+// cannot remove items once added (same constraint as applyIndicatorMenu
+// above), so every possible profile slot is pre-created once, hidden, and
+// Show/Hide'd from then on.
+const maxMenuProfiles = 8
+
+// profileMenuSlot is one pre-created, initially-hidden row in the
+// multi-profile menu section.
+type profileMenuSlot struct {
+	header     *systray.MenuItem
+	session    *systray.MenuItem
+	weekly     *systray.MenuItem
+	switchItem *systray.MenuItem
+
+	targetMu sync.RWMutex
+	target   string // profile name this slot's switchItem currently targets, "" if none
+}
+
+var profileMenuItems [maxMenuProfiles]*profileMenuSlot
+
+// profileMenuMu serializes all writes to the profile menu-item pool.
+// refreshProfileMenu is called from several independent goroutines (the
+// active poller, each non-active profile's poller, the supervisor, and the
+// menu switch-click handler) — without this, concurrent SetTitle/Show/Hide
+// calls on the same *systray.MenuItem from different goroutines would race.
+var profileMenuMu sync.Mutex
+
+// createProfileMenuPool pre-creates every slot in the bounded pool, hidden.
+// Must be called once from onReady, after the existing menu items and before
+// the Quit item (order doesn't matter visually since every slot starts
+// hidden).
+func createProfileMenuPool() {
+	for i := range profileMenuItems {
+		slot := &profileMenuSlot{
+			header:     systray.AddMenuItem("", "Profile"),
+			session:    systray.AddMenuItem("", "Profile 5-hour session usage"),
+			weekly:     systray.AddMenuItem("", "Profile weekly usage"),
+			switchItem: systray.AddMenuItem("", "Switch Claude Code to this profile"),
+		}
+		slot.header.Disable()
+		slot.session.Disable()
+		slot.weekly.Disable()
+		slot.header.Hide()
+		slot.session.Hide()
+		slot.weekly.Hide()
+		slot.switchItem.Hide()
+		profileMenuItems[i] = slot
+	}
+}
+
+// wireProfileMenuClicks starts one goroutine per pool slot forwarding
+// switchItem clicks to SwitchProfile — the indicator-click pattern above does
+// the same thing for a static list; here the *target* profile name for each
+// slot changes over time as refreshProfileMenu re-renders, so each click
+// reads the slot's current target under its own lock instead of a name
+// captured at goroutine-start time.
+func wireProfileMenuClicks(ctx context.Context) {
+	for i := range profileMenuItems {
+		go func(idx int) {
+			slot := profileMenuItems[idx]
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-slot.switchItem.ClickedCh:
+					slot.targetMu.RLock()
+					name := slot.target
+					slot.targetMu.RUnlock()
+					if name == "" {
+						continue
+					}
+					result, err := SwitchProfile(name)
+					if err != nil {
+						log.Printf("menu switch to %q failed: %v", name, err)
+						continue
+					}
+					if !result.AlreadyActive {
+						log.Printf("menu switch: %s -> %s (credential: %s)", result.From, result.To, result.Health)
+					}
+					refreshProfileMenu()
+					requestRefresh()
+				}
+			}
+		}(i)
+	}
+}
+
+// profileMenuRow is the pure, testable render model for one profile's menu
+// slot — computed by buildProfileMenuRows, applied to real systray widgets by
+// applyProfileMenu.
+type profileMenuRow struct {
+	profileName   string
+	header        string
+	sessionLine   string
+	weeklyLine    string
+	switchVisible bool
+}
+
+// staleMenuTimeFormat matches formatResetTime's clock style (no seconds).
+const staleMenuTimeFormat = "3:04 PM"
+
+// buildProfileMenuRows computes the per-profile menu rows for the
+// multi-profile section (ISC-50, 51, 89). profiles is the full registry in
+// registration order; activeName is the currently active profile; snapshot
+// looks up cached data for a profile by name, returning
+// (limits, lastGoodAt, frozen, hasData). Callers gate on len(profiles) > 1
+// themselves (ISC-54) — this function only decides what to render, not
+// whether to.
+func buildProfileMenuRows(
+	profiles []ProfileMeta,
+	activeName string,
+	snapshot func(name string) (limits *UsageLimits, lastGoodAt time.Time, frozen bool, hasData bool),
+) []profileMenuRow {
+	rows := make([]profileMenuRow, 0, len(profiles))
+	for _, p := range profiles {
+		row := profileMenuRow{profileName: p.Name}
+		isActive := p.Name == activeName
+		if isActive {
+			row.header = fmt.Sprintf("%s — active", p.Name)
+		} else {
+			row.header = p.Name
+			row.switchVisible = true
+		}
+
+		limits, lastGoodAt, frozen, hasData := snapshot(p.Name)
+		var five, weekly *UsageLimit
+		if hasData && limits != nil {
+			five, weekly = limits.FiveHour, limits.SevenDay
+		}
+		sessionLine := formatUsageWithReset(five, "5-Hour Session:")
+		weeklyLine := formatUsageWithReset(weekly, "Weekly (All):")
+		if frozen && !lastGoodAt.IsZero() {
+			asOf := fmt.Sprintf(" (as of %s)", lastGoodAt.Local().Format(staleMenuTimeFormat))
+			sessionLine += asOf
+		}
+		row.sessionLine = sessionLine
+		row.weeklyLine = weeklyLine
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// profileSnapshotFunc returns the snapshot function buildProfileMenuRows
+// needs: the active profile's data comes from the pre-existing single-profile
+// globals (lastLimits/consecutiveErrors — untouched by this feature), every
+// other profile's data comes from its own profileState.
+func profileSnapshotFunc(activeName string) func(name string) (*UsageLimits, time.Time, bool, bool) {
+	return func(name string) (*UsageLimits, time.Time, bool, bool) {
+		if name == activeName {
+			limitsMutex.RLock()
+			l := lastLimits
+			at := lastLimitsAt
+			taggedFor := lastLimitsProfile
+			limitsMutex.RUnlock()
+
+			// The globals are shared with the pre-existing single-profile
+			// machinery and only belong to THIS row when they were actually
+			// fetched while this profile was active. A `profile switch` made
+			// via the CLI (a separate process, so it never fires
+			// requestRefresh) flips activeName immediately, but the globals
+			// keep holding the PREVIOUS active profile's numbers until the
+			// daemon's own active poller catches up on its next tick (up to
+			// refreshInterval later, main.go updateStats). Rendering those
+			// stale globals under the new profile's "— active" header would
+			// silently show the wrong account (ISC-89 regression). A tag
+			// mismatch — including daemon-start, where lastLimitsProfile is
+			// still "" because no fetch has completed yet — falls through to
+			// no-data instead, exactly like a non-active profile with no
+			// cached poll yet: hasData=false, the row renders "awaiting
+			// data" via formatUsageWithReset(nil, ...), never a crash.
+			if l == nil || taggedFor != activeName {
+				return nil, time.Time{}, false, false
+			}
+
+			consecutiveMutex.Lock()
+			frozen := consecutiveErrors > 0
+			consecutiveMutex.Unlock()
+			// The active profile row shows the same "(as of ...)" staleness
+			// marker as any other frozen profile (ISC-89); the menubar title
+			// itself keeps the pre-existing keep-stale behavior (ISC-53).
+			return l, at, frozen, true
+		}
+		s, ok := getProfileState(name)
+		if !ok {
+			return nil, time.Time{}, false, false
+		}
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.lastLimits, s.lastGoodAt, s.frozen, s.lastLimits != nil
+	}
+}
+
+// refreshProfileMenu re-reads the profile registry and re-renders the
+// multi-profile menu section (or hides it entirely at <=1 profile, ISC-54)
+// from whatever data is currently cached per profile. Called after every
+// active-profile poll, every non-active-profile poll, every supervisor
+// reconcile, and every menu-triggered switch, so the menu picks up CLI-made
+// switches and registry changes within one poll cycle (ISC-56) without a
+// dedicated timer of its own.
+func refreshProfileMenu() {
+	if profileMenuItems[0] == nil {
+		return // onReady has not created the pool yet (not the systray daemon process)
+	}
+
+	cfg := LoadConfig()
+	applyProfileMenu(cfg.Profiles, activeProfileName(cfg))
+}
+
+// applyProfileMenu renders profiles/activeName into the pre-created menu
+// pool, hiding every slot when <=1 profile is configured (ISC-54) and any
+// slot beyond len(profiles) (bounded pool, up to maxMenuProfiles — a profile
+// count beyond the pool size degrades to showing only the first
+// maxMenuProfiles, never a crash).
+func applyProfileMenu(profiles []ProfileMeta, activeName string) {
+	profileMenuMu.Lock()
+	defer profileMenuMu.Unlock()
+
+	show := len(profiles) > 1
+	var rows []profileMenuRow
+	if show {
+		rows = buildProfileMenuRows(profiles, activeName, profileSnapshotFunc(activeName))
+	}
+
+	for i, slot := range profileMenuItems {
+		if !show || i >= len(rows) {
+			slot.header.Hide()
+			slot.session.Hide()
+			slot.weekly.Hide()
+			slot.switchItem.Hide()
+			slot.targetMu.Lock()
+			slot.target = ""
+			slot.targetMu.Unlock()
+			continue
+		}
+
+		row := rows[i]
+		slot.header.SetTitle(row.header)
+		slot.header.Show()
+		slot.session.SetTitle(row.sessionLine)
+		slot.session.Show()
+		slot.weekly.SetTitle(row.weeklyLine)
+		slot.weekly.Show()
+
+		if row.switchVisible {
+			slot.switchItem.SetTitle("Switch Claude Code here: " + row.profileName)
+			slot.switchItem.Show()
+			slot.targetMu.Lock()
+			slot.target = row.profileName
+			slot.targetMu.Unlock()
+		} else {
+			slot.switchItem.Hide()
+			slot.targetMu.Lock()
+			slot.target = ""
+			slot.targetMu.Unlock()
+		}
+	}
+}
+
+// --- Terminal status: per-profile sections (F6, ISC-48) ---------------------
+
+// credentialStatusLabel renders a CredentialStatus for one-line CLI display.
+func credentialStatusLabel(s CredentialStatus) string {
+	switch s {
+	case CredentialLoggedIn:
+		return "logged in"
+	case CredentialExpired:
+		return "expired (waiting for Claude Code to refresh)"
+	default:
+		return "needs login"
+	}
+}
+
+// displayMultiProfileStatus prints a status section per registered profile
+// (ISC-48), each independently fetched via that profile's own per-dir token
+// so one profile's expired/missing credential never blocks another's section
+// from printing (mirrors the poller's independence, ISC-40).
+func displayMultiProfileStatus(profiles []ProfileMeta, activeName string) {
+	for _, p := range profiles {
+		marker := ""
+		if p.Name == activeName {
+			marker = " (active)"
+		}
+		fmt.Printf("=== Profile: %s%s ===\n", p.Name, marker)
+
+		dir := p.Dir
+		client := NewOAuthUsageClient(func() (string, error) { return CurrentOAuthTokenForDir(dir) })
+		limits, err := client.GetUsageLimits()
+		if err != nil {
+			fmt.Printf("  Usage unavailable (%s): %s\n", credentialStatusLabel(CredentialHealth(dir)), briefStatusErr(err))
+			fmt.Println()
+			continue
+		}
+		displayUsageStats(limits)
+	}
+}
+
+// redactedFetchErr renders a fetch error for log output. A raw error can
+// embed an HTTP response body verbatim (RateLimitError keeps it for
+// diagnostics), and a response body is not guaranteed token-free — so the
+// daemon log gets only a classification plus token-free metadata, never the
+// raw error (ISC-60; same caution as briefStatusErr below for the CLI).
+func redactedFetchErr(err error) string {
+	var rl *RateLimitError
+	if errors.As(err, &rl) {
+		if rl.RetryAfter > 0 {
+			return fmt.Sprintf("rate limited (status %d), retry after %s", rl.StatusCode, rl.RetryAfter)
+		}
+		return fmt.Sprintf("rate limited (status %d)", rl.StatusCode)
+	}
+	return briefStatusErr(err)
+}
+
+// briefStatusErr renders a fetch error for the terminal status view without
+// ever including a raw HTTP response body (which, unlike this program's own
+// error messages, is not guaranteed token-free — ISC-60 caution).
+func briefStatusErr(err error) string {
+	switch {
+	case errors.Is(err, ErrAuthFailed):
+		return "authentication failed"
+	case errors.Is(err, ErrTransient):
+		return "temporarily unavailable"
+	default:
+		return "fetch error"
+	}
+}
+
+// printUsageStatusSection prints today's usage for the CLI: a per-profile
+// breakdown when more than one profile is configured (ISC-48), or the single
+// active fetch (limits) otherwise — identical to pre-feature output at <=1
+// profile (ISC-42/54 CLI analogue).
+func printUsageStatusSection(limits *UsageLimits) {
+	profiles := ListProfiles()
+	if len(profiles) > 1 {
+		displayMultiProfileStatus(profiles, activeProfileName(LoadConfig()))
+		return
+	}
+	displayUsageStats(limits)
+}
+
+// --- CLI surface: `profile ...` subcommands (F6, ISC-15, 16, 43-49) --------
+
+// claudeAccountIdentity is the tiny slice of <dir>/.claude.json this program
+// reads to show an email/identity for `profile list` (ISC-16).
+type claudeAccountIdentity struct {
+	OauthAccount *struct {
+		EmailAddress string `json:"emailAddress"`
+	} `json:"oauthAccount"`
+}
+
+// profileIdentityFor reads <dir>/.claude.json (if present) and returns the
+// signed-in account's email, or "" if the file is absent, unreadable, or has
+// no oauthAccount — never an error, since this is display-only best-effort
+// and read-only (ISC-16).
+func profileIdentityFor(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		return ""
+	}
+	var id claudeAccountIdentity
+	if err := json.Unmarshal(data, &id); err != nil {
+		return ""
+	}
+	if id.OauthAccount == nil {
+		return ""
+	}
+	return id.OauthAccount.EmailAddress
+}
+
+// filterEnv returns env with every entry whose key equals key removed — used
+// to strip an inherited CLAUDE_CONFIG_DIR before exec'ing into the default
+// profile, so a caller's shell export can never leak through and silently
+// override "unset" (ISC-15's default-profile clause, the login-flow analogue
+// of ISC-83).
+func filterEnv(env []string, key string) []string {
+	prefix := key + "="
+	out := env[:0:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// realClaudeBinary resolves the actual `claude` binary on PATH for `profile
+// login`, explicitly excluding this program's own installed shim directory —
+// `profile login` must reach the REAL claude, never our own shim (which would
+// just read the active-profile state file and point right back at whatever
+// is already active, defeating the point of logging into a SPECIFIC
+// profile).
+func realClaudeBinary() (string, error) {
+	shim, shimErr := shimDir()
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			continue
+		}
+		if shimErr == nil && dir == shim {
+			continue
+		}
+		candidate := filepath.Join(dir, "claude")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not find the real 'claude' binary on PATH (excluding the claude-monitor-lite shim directory) — install Claude Code first")
+}
+
+func handleProfileCommand(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-monitor-lite profile <add|list|switch|remove|login|shim> ...")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "add":
+		handleProfileAdd(args[1:])
+	case "list":
+		handleProfileList()
+	case "switch":
+		handleProfileSwitch(args[1:])
+	case "remove":
+		handleProfileRemove(args[1:])
+	case "login":
+		handleProfileLogin(args[1:])
+	case "shim":
+		handleProfileShim(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown profile subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func handleProfileAdd(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-monitor-lite profile add <name> [--dir path]")
+		os.Exit(1)
+	}
+	name := args[0]
+	dir := ""
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--dir" && i+1 < len(args) {
+			dir = args[i+1]
+			i++
+		}
+	}
+	meta, err := AddProfile(name, dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to add profile: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✓ Profile %q added at %s\n", meta.Name, meta.Dir)
+	fmt.Printf("  Next: claude-monitor-lite profile login %s\n", meta.Name)
+}
+
+func handleProfileList() {
+	if err := EnsureDefaultProfile(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to prepare profile registry: %v\n", err)
+		os.Exit(1)
+	}
+	cfg := LoadConfig()
+	active := activeProfileName(cfg)
+
+	fmt.Println("Profiles:")
+	for _, p := range cfg.Profiles {
+		marker := " "
+		if p.Name == active {
+			marker = "*"
+		}
+		identity := profileIdentityFor(p.Dir)
+		if identity == "" {
+			identity = "(no identity on file)"
+		}
+		fmt.Printf(" %s %-20s %-40s %-14s %s\n", marker, p.Name, p.Dir, identity, credentialStatusLabel(CredentialHealth(p.Dir)))
+	}
+}
+
+func handleProfileSwitch(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-monitor-lite profile switch <name>")
+		os.Exit(1)
+	}
+	result, err := SwitchProfile(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Switch failed: %v\n", err)
+		os.Exit(1)
+	}
+	if result.AlreadyActive {
+		fmt.Printf("Profile %q is already active.\n", result.To)
+		return
+	}
+	fmt.Printf("✓ Switched active profile: %s -> %s (credential: %s)\n", result.From, result.To, credentialStatusLabel(result.Health))
+	fmt.Println("Only NEW claude sessions (started after this, via the installed shim) pick this up — already-running sessions are unaffected.")
+}
+
+func handleProfileRemove(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-monitor-lite profile remove <name>")
+		os.Exit(1)
+	}
+	if err := RemoveProfile(args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to remove profile: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✓ Profile %q removed from the registry (its config directory and credentials were left untouched).\n", args[0])
+}
+
+func handleProfileLogin(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-monitor-lite profile login <name>")
+		os.Exit(1)
+	}
+	name := args[0]
+
+	if err := EnsureDefaultProfile(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to prepare profile registry: %v\n", err)
+		os.Exit(1)
+	}
+	profiles := ListProfiles()
+	meta, ok := findProfile(profiles, name)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Unknown profile %q. Known profiles: %s\n", name, strings.Join(profileNames(profiles), ", "))
+		os.Exit(1)
+	}
+
+	realClaude, err := realClaudeBinary()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	env := filterEnv(os.Environ(), "CLAUDE_CONFIG_DIR")
+	dirDesc := "CLAUDE_CONFIG_DIR unset — default"
+	if meta.Name != defaultProfileName {
+		env = append(env, "CLAUDE_CONFIG_DIR="+meta.Dir)
+		dirDesc = "CLAUDE_CONFIG_DIR=" + meta.Dir
+	}
+
+	fmt.Printf("Launching claude for profile %q (%s)...\n", meta.Name, dirDesc)
+
+	cmd := exec.Command(realClaude)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = env
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "claude exited with error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func handleProfileShim(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: claude-monitor-lite profile shim <install|uninstall>")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "install":
+		pathLine, err := InstallShim()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to install shim: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Shim installed.")
+		fmt.Println("Add this to your shell rc (e.g. ~/.zshrc or ~/.bashrc), then restart your shell:")
+		fmt.Println()
+		fmt.Println("  " + pathLine)
+		fmt.Println()
+		fmt.Println("This makes every NEW `claude` invocation honor `claude-monitor-lite profile switch`.")
+	case "uninstall":
+		if err := UninstallShim(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to uninstall shim: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Shim uninstalled.")
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown shim subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
 func main() {
 	appConfig = LoadConfig()
 	migrateStripLegacySecrets()
@@ -390,6 +1226,8 @@ func main() {
 			handleInstall()
 		case "uninstall":
 			handleUninstall()
+		case "profile":
+			handleProfileCommand(os.Args[2:])
 		case "version", "--version", "-v":
 			fmt.Printf("claude-monitor-lite %s\n", version)
 			os.Exit(0)
@@ -421,6 +1259,15 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
 	fmt.Println()
+	fmt.Println("Multi-profile (isolated Claude Code environments):")
+	fmt.Println("  claude-monitor-lite profile add <name> [--dir path]   Register a new isolated profile")
+	fmt.Println("  claude-monitor-lite profile list                     List profiles (dir, identity, health, active)")
+	fmt.Println("  claude-monitor-lite profile switch <name>             Make <name> the active profile")
+	fmt.Println("  claude-monitor-lite profile remove <name>             Unregister a profile (keeps its config dir)")
+	fmt.Println("  claude-monitor-lite profile login <name>              Interactive claude login for a profile")
+	fmt.Println("  claude-monitor-lite profile shim install              Install the global claude-switching shim")
+	fmt.Println("  claude-monitor-lite profile shim uninstall            Remove the shim")
+	fmt.Println()
 	fmt.Println("First time? Just run: claude-monitor-lite")
 }
 
@@ -449,7 +1296,7 @@ func handleAutoStart() {
 	if err == nil {
 		client := createClientFromSession(session)
 		if limits, err := client.GetUsageLimits(); err == nil {
-			displayUsageStats(limits)
+			printUsageStatusSection(limits)
 		}
 	}
 
@@ -555,7 +1402,7 @@ func handleStatusDisplay() {
 		os.Exit(1)
 	}
 
-	displayUsageStats(limits)
+	printUsageStatusSection(limits)
 
 	// Show which indicator is displayed in menu bar
 	selected := findIndicator(getMenuBarIndicator())
@@ -767,13 +1614,25 @@ func onReady() {
 	mAbout := systray.AddMenuItem("About", "Show version info")
 	systray.AddSeparator()
 
+	// Multi-profile section: a bounded pool of pre-created, hidden menu
+	// items (systray cannot remove items once added — see applyIndicatorMenu
+	// above for the same pattern). With <=1 profile configured every slot
+	// stays hidden, so the menu renders exactly as pre-feature (ISC-54).
+	createProfileMenuPool()
+	wireProfileMenuClicks(appCtx)
+
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
 	updateMenuCheckmarks()
+	refreshProfileMenu()
 
 	// A single worker owns all usage fetching, so updateStats never runs
 	// concurrently with itself.
 	go runUpdateWorker(appCtx)
+
+	// Independent poll loop per non-active profile (ISC-36..42, 85-87);
+	// no-op layer when <=1 profile is configured.
+	go runMultiProfileSupervisor(appCtx)
 
 	// One goroutine per indicator forwards its clicks — the indicator count is
 	// dynamic, so a single static select cannot cover them.
@@ -997,10 +1856,28 @@ func runUpdateWorker(ctx context.Context) {
 // success or on a non-rate-limit error, or a value backed off toward
 // maxBackoffInterval while the endpoint keeps returning 429.
 func updateStats() time.Duration {
+	// Re-read the profile registry/active profile every cycle so a CLI-made
+	// `profile switch` or `profile add`/`remove` is reflected in the menu
+	// within one poll cycle (ISC-28, 56), without a dedicated timer of its
+	// own — this is the cheapest place to piggyback since it already runs on
+	// the same interval as the active profile's own poll.
+	refreshProfileMenu()
+
 	if claudeClient == nil {
 		systray.SetTitle("⚪ Error")
 		return refreshInterval
 	}
+
+	// Capture which profile this fetch is for now, before the request goes
+	// out — claudeClient's token provider (CurrentOAuthToken ->
+	// activeProfileDir()) re-resolves the active profile fresh per call, so
+	// this reads the same config state the provider is about to read.
+	// Tagging with the name captured at the OLD assignment time (after the
+	// round trip) would misattribute exactly the wrong-account data this
+	// fix exists to prevent, if a CLI switch landed mid-fetch; capturing
+	// before the call ties the tag to whichever credentials actually
+	// produced the response (ISC-89).
+	fetchedForProfile := activeProfileName(LoadConfig())
 
 	limits, err := claudeClient.GetUsageLimits()
 	if err != nil && errors.Is(err, ErrAuthFailed) && claudeClient.authMode == AuthModeOAuth {
@@ -1047,9 +1924,9 @@ func updateStats() time.Duration {
 			indicatorMenuItems[0].SetTitle("Session expired - please login again")
 			systray.SetTitle("⚪ Login")
 		case actionKeepStale:
-			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
+			log.Printf("Transient error (%d/%d): %s", count, maxTransientErrors, redactedFetchErr(err))
 		case actionShowError:
-			log.Printf("Error fetching usage: %v", err)
+			log.Printf("Error fetching usage: %s", redactedFetchErr(err))
 			systray.SetTitle("⚪ Error")
 			indicatorMenuItems[0].Show()
 			indicatorMenuItems[0].SetTitle("Error loading data")
@@ -1069,6 +1946,8 @@ func updateStats() time.Duration {
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()
 	lastLimits = limits
+	lastLimitsAt = time.Now()
+	lastLimitsProfile = fetchedForProfile
 	limitsMutex.Unlock()
 
 	// Update menu bar display

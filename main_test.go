@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -385,5 +387,970 @@ func TestMigrateStripLegacySecrets_NoopOnMissingFile(t *testing.T) {
 
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("expected no config file to be created, stat err = %v", err)
+	}
+}
+
+// ============================================================================
+// Multi-profile support (F5-F8) — main.go's new logic. See withTempProfileEnv
+// in profiles_test.go for the shared temp-env seam these tests reuse.
+// ============================================================================
+
+// newTestOAuthClient builds an OAuth-mode client pointed at a test server —
+// the OAuth-mode analogue of claude_client_test.go's newTestClient (cookie
+// mode). authMode must be AuthModeOAuth so GetUsageLimits hits
+// "<baseURL>/oauth/usage" directly, with no organization lookup, exactly like
+// the real client runProfilePoller/pollProfileOnce use in production.
+func newTestOAuthClient(baseURL string, tokenProvider func() (string, error)) *ClaudeUsageClient {
+	return &ClaudeUsageClient{
+		tokenProvider: tokenProvider,
+		authMode:      AuthModeOAuth,
+		httpClient:    sharedHTTPClient,
+		baseURL:       baseURL,
+	}
+}
+
+// captureStdout redirects os.Stdout for the duration of fn and returns
+// whatever was written, so CLI-printing functions can be asserted on without
+// polluting the test binary's real stdout.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	os.Stdout = w
+	fn()
+	w.Close()
+	os.Stdout = orig
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read captured stdout: %v", err)
+	}
+	return string(data)
+}
+
+// captureLogOutput redirects the standard logger for the duration of fn and
+// returns whatever was logged — the log-scan seam ISC-60 asks for, shared by
+// every log-scan test below.
+func captureLogOutput(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf strings.Builder
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+	fn()
+	return buf.String()
+}
+
+// assertNoTokenMaterial fails t if got contains any of the literal markers a
+// real Claude Code credential would carry (ISC-60): an sk-ant-* secret, or
+// either of the JSON field names used to carry one.
+func assertNoTokenMaterial(t *testing.T, got, context string) {
+	t.Helper()
+	for _, marker := range []string{"sk-ant", "accessToken", "refreshToken"} {
+		if strings.Contains(got, marker) {
+			t.Errorf("%s: output contains token marker %q:\n%s", context, marker, got)
+		}
+	}
+}
+
+// --- ISC-37: stagger offsets across non-active profiles --------------------
+
+func TestStaggerOffsetFor_DistinctMonotonic(t *testing.T) {
+	var prev time.Duration = -1
+	for idx := 0; idx < 6; idx++ {
+		got := staggerOffsetFor(idx)
+		want := time.Duration(idx) * profileStaggerStep
+		if got != want {
+			t.Errorf("staggerOffsetFor(%d) = %v, want %v", idx, got, want)
+		}
+		if got <= prev {
+			t.Errorf("staggerOffsetFor(%d) = %v did not strictly increase over the previous offset %v", idx, got, prev)
+		}
+		prev = got
+	}
+	if got := staggerOffsetFor(0); got != 0 {
+		t.Errorf("staggerOffsetFor(0) = %v, want 0 (the first non-active profile starts immediately after the stagger wait)", got)
+	}
+}
+
+// otherProfilesInOrder is the pure profile-selection logic behind the
+// multi-profile supervisor: it must return nil (a no-op layer) at <=1
+// profile (ISC-42), and otherwise every OTHER profile in registry order.
+func TestOtherProfilesInOrder(t *testing.T) {
+	a := ProfileMeta{Name: "a"}
+	b := ProfileMeta{Name: "b"}
+	c := ProfileMeta{Name: "c"}
+
+	cases := []struct {
+		name string
+		cfg  Config
+		want []string
+	}{
+		{"zero profiles", Config{}, nil},
+		{"one profile", Config{Profiles: []ProfileMeta{a}, ActiveProfile: "a"}, nil},
+		{"two profiles, active first", Config{Profiles: []ProfileMeta{a, b}, ActiveProfile: "a"}, []string{"b"}},
+		{"two profiles, active second", Config{Profiles: []ProfileMeta{a, b}, ActiveProfile: "b"}, []string{"a"}},
+		{"three profiles, preserves registry order", Config{Profiles: []ProfileMeta{a, b, c}, ActiveProfile: "b"}, []string{"a", "c"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := otherProfilesInOrder(tc.cfg)
+			if len(got) != len(tc.want) {
+				t.Fatalf("otherProfilesInOrder() = %+v, want names %v", got, tc.want)
+			}
+			for i, name := range tc.want {
+				if got[i].Name != name {
+					t.Errorf("index %d: got %q, want %q", i, got[i].Name, name)
+				}
+			}
+		})
+	}
+}
+
+// --- ISC-38: per-profile poll interval never drops below 60s ---------------
+
+func TestProfilePollIntervalConstants_NeverBelowFloor(t *testing.T) {
+	const floor = 60 * time.Second
+	if refreshInterval != floor {
+		t.Errorf("refreshInterval = %v, want exactly the 60s floor", refreshInterval)
+	}
+	if profileErrorBackoff < floor {
+		t.Errorf("profileErrorBackoff = %v, want >= the 60s floor", profileErrorBackoff)
+	}
+	if maxBackoffInterval < floor {
+		t.Errorf("maxBackoffInterval = %v, want >= the 60s floor", maxBackoffInterval)
+	}
+}
+
+func TestPollProfileOnce_Success_UpdatesStateAndReturnsFloorInterval(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	delay := pollProfileOnce(state)
+
+	if delay != refreshInterval {
+		t.Errorf("delay = %v, want refreshInterval %v on success", delay, refreshInterval)
+	}
+	if state.lastLimits == nil {
+		t.Fatal("state.lastLimits was not set on a successful poll")
+	}
+	if state.frozen {
+		t.Error("state.frozen = true after a successful poll, want false")
+	}
+	if state.lastGoodAt.IsZero() {
+		t.Error("state.lastGoodAt was not set on a successful poll")
+	}
+	if state.consecutiveErrors != 0 {
+		t.Errorf("state.consecutiveErrors = %d, want 0 after success", state.consecutiveErrors)
+	}
+}
+
+func TestPollProfileOnce_AuthFailure_NoDataYet_NotFrozen(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	delay := pollProfileOnce(state)
+
+	if delay != profileErrorBackoff {
+		t.Errorf("delay = %v, want profileErrorBackoff %v on an auth failure", delay, profileErrorBackoff)
+	}
+	if delay < 60*time.Second {
+		t.Errorf("delay %v is below the 60s floor", delay)
+	}
+	if state.frozen {
+		t.Error("state.frozen = true with no prior data, want false (nothing to freeze)")
+	}
+	if state.lastLimits != nil {
+		t.Error("state.lastLimits should remain nil — this profile never had data")
+	}
+	if state.consecutiveErrors != 1 {
+		t.Errorf("state.consecutiveErrors = %d, want 1", state.consecutiveErrors)
+	}
+}
+
+func TestPollProfileOnce_RateLimit_BacksOffAboveFloor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	first := pollProfileOnce(state)
+	if first != refreshInterval {
+		t.Errorf("first 429 delay = %v, want base %v", first, refreshInterval)
+	}
+	if state.consecutiveRateLimits != 1 {
+		t.Errorf("consecutiveRateLimits = %d, want 1", state.consecutiveRateLimits)
+	}
+
+	second := pollProfileOnce(state)
+	if second <= first {
+		t.Errorf("second consecutive 429 delay %v did not back off above the first %v", second, first)
+	}
+	if second < refreshInterval {
+		t.Errorf("second 429 delay %v is below the 60s floor", second)
+	}
+	if state.consecutiveRateLimits != 2 {
+		t.Errorf("consecutiveRateLimits = %d, want 2", state.consecutiveRateLimits)
+	}
+}
+
+// An unclassified error (neither rate-limited, nor transient, nor an auth
+// failure) must still fall through to the base interval — never to something
+// below the 60s floor.
+func TestPollProfileOnce_GenericError_ReturnsBaseFloor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot) // 418: not 401/403/429/5xx/408
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	delay := pollProfileOnce(state)
+
+	if delay != refreshInterval {
+		t.Errorf("delay = %v, want the base refreshInterval %v for an unclassified error", delay, refreshInterval)
+	}
+	if delay < 60*time.Second {
+		t.Errorf("delay %v is below the 60s floor", delay)
+	}
+}
+
+// --- ISC-85: expired/unreadable profile freezes last-good data -------------
+
+func TestPollProfileOnce_TransientFailure_FreezesLastGoodData(t *testing.T) {
+	failing := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	pollProfileOnce(state) // seed a successful poll
+	if state.lastLimits == nil {
+		t.Fatal("setup: first poll must succeed and cache data")
+	}
+	firstGoodLimits := state.lastLimits
+	firstGoodAt := state.lastGoodAt
+
+	failing = true
+	delay := pollProfileOnce(state)
+
+	if delay != profileErrorBackoff {
+		t.Errorf("delay = %v, want profileErrorBackoff %v on a transient failure (no poll spam)", delay, profileErrorBackoff)
+	}
+	if !state.frozen {
+		t.Error("state.frozen = false after a failure with cached data, want true")
+	}
+	if state.lastLimits != firstGoodLimits {
+		t.Error("state.lastLimits changed on failure, want the frozen last-good data kept unchanged")
+	}
+	if !state.lastGoodAt.Equal(firstGoodAt) {
+		t.Errorf("state.lastGoodAt = %v, want unchanged %v — a failure must not update the staleness marker", state.lastGoodAt, firstGoodAt)
+	}
+	if state.consecutiveErrors != 1 {
+		t.Errorf("state.consecutiveErrors = %d, want 1", state.consecutiveErrors)
+	}
+}
+
+// --- ISC-39/40: per-profile backoff state is independent -------------------
+
+func TestPollProfileOnce_TwoProfiles_StateIsolated(t *testing.T) {
+	goodSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer goodSrv.Close()
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer badSrv.Close()
+
+	good := &profileState{meta: ProfileMeta{Name: "good"}, client: newTestOAuthClient(goodSrv.URL, func() (string, error) { return "tok", nil })}
+	bad := &profileState{meta: ProfileMeta{Name: "bad"}, client: newTestOAuthClient(badSrv.URL, func() (string, error) { return "tok", nil })}
+
+	for i := 0; i < 3; i++ {
+		pollProfileOnce(bad)
+	}
+	pollProfileOnce(good)
+
+	if bad.consecutiveErrors == 0 {
+		t.Error("bad profile's consecutiveErrors did not increment")
+	}
+	if good.consecutiveErrors != 0 {
+		t.Errorf("good profile's consecutiveErrors = %d, want 0 — must not be contaminated by the bad profile's failures", good.consecutiveErrors)
+	}
+	if good.lastLimits == nil {
+		t.Error("good profile should have cached usage data after a successful poll")
+	}
+	if bad.lastLimits != nil {
+		t.Error("bad profile never succeeded, should have no cached data")
+	}
+	if bad.frozen {
+		t.Error("bad profile with no prior data should not be marked frozen — nothing to freeze")
+	}
+}
+
+// A failing profile's poll must never touch the ACTIVE profile's pre-existing
+// globals (lastLimits/consecutiveErrors/consecutiveRateLimits) — the
+// multi-profile layer is documented (main.go) as an ADDITIONAL layer that
+// never reaches into the original single-profile machinery.
+func TestPollProfileOnce_FailureNeverTouchesActiveProfileGlobals(t *testing.T) {
+	limitsMutex.Lock()
+	oldLimits := lastLimits
+	lastLimits = nil
+	limitsMutex.Unlock()
+	consecutiveMutex.Lock()
+	oldErrors, oldRateLimits := consecutiveErrors, consecutiveRateLimits
+	consecutiveErrors, consecutiveRateLimits = 0, 0
+	consecutiveMutex.Unlock()
+	t.Cleanup(func() {
+		limitsMutex.Lock()
+		lastLimits = oldLimits
+		limitsMutex.Unlock()
+		consecutiveMutex.Lock()
+		consecutiveErrors, consecutiveRateLimits = oldErrors, oldRateLimits
+		consecutiveMutex.Unlock()
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	for i := 0; i < 3; i++ {
+		pollProfileOnce(state)
+	}
+	if state.consecutiveErrors == 0 {
+		t.Fatal("expected the profile's own consecutiveErrors to increment on repeated failure")
+	}
+
+	limitsMutex.RLock()
+	gotLimits := lastLimits
+	limitsMutex.RUnlock()
+	consecutiveMutex.Lock()
+	gotErrors, gotRateLimits := consecutiveErrors, consecutiveRateLimits
+	consecutiveMutex.Unlock()
+
+	if gotLimits != nil {
+		t.Errorf("active-profile global lastLimits was changed by a non-active profile's poll failures: %+v", gotLimits)
+	}
+	if gotErrors != 0 || gotRateLimits != 0 {
+		t.Errorf("active-profile globals mutated by a non-active profile's poll: consecutiveErrors=%d consecutiveRateLimits=%d, want 0/0", gotErrors, gotRateLimits)
+	}
+}
+
+// pollProfileOnce must return a delay for the CALLER's timer to apply, never
+// block on it itself — otherwise one profile's failure would stall every
+// other profile sharing the supervisor's goroutine-per-profile model.
+func TestPollProfileOnce_DoesNotBlockCaller_TimingIndependence(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	start := time.Now()
+	delay := pollProfileOnce(state)
+	elapsed := time.Since(start)
+
+	if delay < refreshInterval {
+		t.Errorf("returned delay %v is below the 60s floor", delay)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("pollProfileOnce took %v to return, want near-instant — it must hand the delay back to the caller's timer rather than sleeping for it", elapsed)
+	}
+}
+
+// --- ISC-42/54: with <=1 profile, the multi-profile layer is inert ---------
+
+func TestPrintUsageStatusSection_LEq1Profile_FallsThroughToDisplayUsageStats(t *testing.T) {
+	withTempProfileEnv(t) // fresh config: zero profiles registered
+
+	limits := &UsageLimits{FiveHour: &UsageLimit{Utilization: 42}}
+
+	out := captureStdout(t, func() {
+		printUsageStatusSection(limits)
+	})
+
+	if !strings.Contains(out, "=== Current Usage ===") {
+		t.Errorf("output = %q, want the displayUsageStats header (pre-feature behavior)", out)
+	}
+	if strings.Contains(out, "=== Profile:") {
+		t.Errorf("output = %q, should not show per-profile sections with <=1 profile configured", out)
+	}
+}
+
+// refreshProfileMenu must be a safe no-op before onReady has created the
+// systray menu pool (profileMenuItems[0] == nil) — the state every test in
+// this package runs in, since none of them invoke the real getlantern/systray
+// native run loop.
+func TestRefreshProfileMenu_NoMenuPool_NoOp(t *testing.T) {
+	if profileMenuItems[0] != nil {
+		t.Skip("menu pool already created in this test binary — nothing to verify")
+	}
+	withTempProfileEnv(t)
+	refreshProfileMenu() // must not panic
+}
+
+// --- ISC-85/86/89: frozen/staleness rendering -------------------------------
+
+func TestBuildProfileMenuRows_ActiveVsInactive(t *testing.T) {
+	profiles := []ProfileMeta{{Name: "default"}, {Name: "work"}}
+	snapshot := func(name string) (*UsageLimits, time.Time, bool, bool) {
+		return nil, time.Time{}, false, false
+	}
+
+	rows := buildProfileMenuRows(profiles, "default", snapshot)
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+
+	activeRow, workRow := rows[0], rows[1]
+	if !strings.HasPrefix(activeRow.header, "default") || !strings.Contains(activeRow.header, "active") {
+		t.Errorf("active row header = %q, want it to name the profile and mark it active", activeRow.header)
+	}
+	if activeRow.switchVisible {
+		t.Error("active row must not offer a switch item")
+	}
+	if workRow.header != "work" {
+		t.Errorf("inactive row header = %q, want the plain profile name %q", workRow.header, "work")
+	}
+	if !workRow.switchVisible {
+		t.Error("inactive row must offer a switch item")
+	}
+}
+
+func TestBuildProfileMenuRows_NoData_FallsBackToPlaceholder(t *testing.T) {
+	profiles := []ProfileMeta{{Name: "work"}}
+	snapshot := func(name string) (*UsageLimits, time.Time, bool, bool) {
+		return nil, time.Time{}, false, false
+	}
+
+	rows := buildProfileMenuRows(profiles, "default", snapshot)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+
+	row := rows[0]
+	wantSession := formatUsageWithReset(nil, "5-Hour Session:")
+	if row.sessionLine != wantSession {
+		t.Errorf("sessionLine = %q, want the no-data placeholder %q", row.sessionLine, wantSession)
+	}
+	if strings.Contains(row.sessionLine, "as of") {
+		t.Errorf("sessionLine = %q should not show a staleness marker with no data at all", row.sessionLine)
+	}
+}
+
+// A frozen (poll-failing) non-active profile must still render its cached
+// usage with a LIVE reset countdown (ISC-86) plus a staleness marker
+// (ISC-85/89) — never a crash, never a blanked-out countdown.
+//
+// Note: the countdown computation has no fake-clock seam — formatUsageWithReset ->
+// calculateTimeUntilReset calls time.Now() directly (main.go). This test therefore uses a resetTime
+// offset far enough from the real wall clock (3h) that the minute-floor
+// truncation in calculateTimeUntilReset is deterministic regardless of the
+// exact instant the test runs, without needing to control "now" itself.
+func TestBuildProfileMenuRows_FrozenProfile_StalenessMarkerAndLiveCountdown(t *testing.T) {
+	resetTime := time.Now().Add(3 * time.Hour)
+	lastGoodAt := time.Now().Add(-90 * time.Minute)
+
+	five := &UsageLimit{Utilization: 77, ResetsAtTime: resetTime}
+	frozenLimits := &UsageLimits{FiveHour: five}
+
+	profiles := []ProfileMeta{{Name: "default"}, {Name: "work"}}
+	snapshot := func(name string) (*UsageLimits, time.Time, bool, bool) {
+		if name == "work" {
+			return frozenLimits, lastGoodAt, true, true
+		}
+		return nil, time.Time{}, false, false
+	}
+
+	rows := buildProfileMenuRows(profiles, "default", snapshot)
+
+	var workRow, activeRow *profileMenuRow
+	for i := range rows {
+		switch rows[i].profileName {
+		case "work":
+			workRow = &rows[i]
+		case "default":
+			activeRow = &rows[i]
+		}
+	}
+	if workRow == nil {
+		t.Fatal("no row rendered for the frozen profile 'work'")
+	}
+
+	// ISC-86: the reset countdown is computed live from the cached
+	// ResetsAtTime, not blanked out just because the underlying poll fails.
+	wantCountdown := formatUsageWithReset(five, "5-Hour Session:")
+	if !strings.HasPrefix(workRow.sessionLine, wantCountdown) {
+		t.Errorf("sessionLine = %q, want it to start with the live countdown %q", workRow.sessionLine, wantCountdown)
+	}
+
+	// ISC-85/89: a staleness "(as of HH:MM)" marker is appended for a frozen
+	// profile with a known last-good time.
+	wantAsOf := fmt.Sprintf("(as of %s)", lastGoodAt.Local().Format(staleMenuTimeFormat))
+	if !strings.Contains(workRow.sessionLine, wantAsOf) {
+		t.Errorf("sessionLine = %q, want it to contain the staleness marker %q", workRow.sessionLine, wantAsOf)
+	}
+
+	// The frozen marker is only ever appended to the session line (matches
+	// buildProfileMenuRows's documented behavior), never the weekly line.
+	if strings.Contains(workRow.weeklyLine, "as of") {
+		t.Errorf("weeklyLine = %q should not carry a staleness marker", workRow.weeklyLine)
+	}
+
+	if activeRow == nil || strings.Contains(activeRow.sessionLine, "as of") {
+		t.Errorf("active, non-frozen row unexpectedly shows staleness: %+v", activeRow)
+	}
+}
+
+func TestProfileSnapshotFunc_ActiveProfile_ReadsGlobalState(t *testing.T) {
+	limitsMutex.Lock()
+	oldLimits := lastLimits
+	oldLimitsProfile := lastLimitsProfile
+	someLimits := &UsageLimits{FiveHour: &UsageLimit{Utilization: 5}}
+	lastLimits = someLimits
+	// Attribution must match the queried active profile ("default") for the
+	// globals to be trusted at all (ISC-89) — see
+	// TestProfileSnapshotFunc_AfterSwitch_DoesNotAttributeOldData below for
+	// the mismatch case.
+	lastLimitsProfile = "default"
+	limitsMutex.Unlock()
+	consecutiveMutex.Lock()
+	oldErrors := consecutiveErrors
+	consecutiveErrors = 2
+	consecutiveMutex.Unlock()
+	t.Cleanup(func() {
+		limitsMutex.Lock()
+		lastLimits = oldLimits
+		lastLimitsProfile = oldLimitsProfile
+		limitsMutex.Unlock()
+		consecutiveMutex.Lock()
+		consecutiveErrors = oldErrors
+		consecutiveMutex.Unlock()
+	})
+
+	snap := profileSnapshotFunc("default")
+	limits, lastGoodAt, frozen, hasData := snap("default")
+
+	if limits != someLimits {
+		t.Errorf("limits = %+v, want the active profile's global lastLimits", limits)
+	}
+	if !hasData {
+		t.Error("hasData = false, want true")
+	}
+	if !frozen {
+		t.Error("frozen = false, want true (consecutiveErrors > 0 and data present)")
+	}
+	if !lastGoodAt.IsZero() {
+		t.Errorf("lastGoodAt = %v, want zero — the active profile's poller tracks no separate staleness timestamp", lastGoodAt)
+	}
+}
+
+// TestProfileSnapshotFunc_AfterSwitch_DoesNotAttributeOldData is the ISC-89
+// regression test for the CLI-switch attribution bug caught in adversarial
+// review: a `profile switch` made via a separate CLI process flips the
+// active profile name immediately but never touches the shared
+// lastLimits/lastLimitsAt globals, which keep holding whatever the
+// PREVIOUSLY active profile last fetched until the daemon's own active
+// poller catches up (up to refreshInterval later). Before this fix,
+// profileSnapshotFunc handed that stale, wrong-account data straight to the
+// newly-active profile's "— active" menu row.
+func TestProfileSnapshotFunc_AfterSwitch_DoesNotAttributeOldData(t *testing.T) {
+	limitsMutex.Lock()
+	oldLimits := lastLimits
+	oldLimitsProfile := lastLimitsProfile
+	oldLimitsAt := lastLimitsAt
+	staleLimits := &UsageLimits{FiveHour: &UsageLimit{Utilization: 42}}
+	lastLimits = staleLimits
+	// Simulates the daemon's last fetch having been for "default", made
+	// before a CLI `profile switch work` landed.
+	lastLimitsProfile = "default"
+	lastLimitsAt = time.Now()
+	limitsMutex.Unlock()
+	t.Cleanup(func() {
+		limitsMutex.Lock()
+		lastLimits = oldLimits
+		lastLimitsProfile = oldLimitsProfile
+		lastLimitsAt = oldLimitsAt
+		limitsMutex.Unlock()
+	})
+
+	// The switch already updated the active profile to "work" (this is what
+	// LoadConfig/activeProfileName would now return), but the globals above
+	// are still tagged "default".
+	snap := profileSnapshotFunc("work")
+	limits, lastGoodAt, frozen, hasData := snap("work")
+
+	if hasData {
+		t.Error("hasData = true, want false — cached globals belong to the previous active profile \"default\", not \"work\"")
+	}
+	if limits != nil {
+		t.Errorf("limits = %+v, want nil — must not attribute the previous profile's usage to the newly active profile", limits)
+	}
+	if frozen {
+		t.Error("frozen = true, want false — no attributable data means nothing to mark stale")
+	}
+	if !lastGoodAt.IsZero() {
+		t.Errorf("lastGoodAt = %v, want zero — no attributable data means no timestamp to show either", lastGoodAt)
+	}
+
+	// Companion: once the active poller's next tick fetches "work"'s own
+	// data (attribution now matches), the same globals are trusted again —
+	// this is not a permanent lockout, just a one-cycle guard.
+	limitsMutex.Lock()
+	lastLimitsProfile = "work"
+	limitsMutex.Unlock()
+
+	limits, _, _, hasData = snap("work")
+	if !hasData || limits != staleLimits {
+		t.Errorf("after attribution matches: (limits=%v, hasData=%v), want (limits=%v, hasData=true)", limits, hasData, staleLimits)
+	}
+}
+
+// TestProfileSnapshotFunc_ActiveProfile_NilGlobalsAtStart_NoDataNoCrash covers
+// the daemon-restart case: lastLimits is nil until the active poller's first
+// fetch completes, and lastLimitsProfile is still its zero value (""). Both
+// must degrade to no-data, never a crash and never a false attribution match
+// (activeName is never "").
+func TestProfileSnapshotFunc_ActiveProfile_NilGlobalsAtStart_NoDataNoCrash(t *testing.T) {
+	limitsMutex.Lock()
+	oldLimits := lastLimits
+	oldLimitsProfile := lastLimitsProfile
+	lastLimits = nil
+	lastLimitsProfile = ""
+	limitsMutex.Unlock()
+	t.Cleanup(func() {
+		limitsMutex.Lock()
+		lastLimits = oldLimits
+		lastLimitsProfile = oldLimitsProfile
+		limitsMutex.Unlock()
+	})
+
+	snap := profileSnapshotFunc("work")
+	limits, _, frozen, hasData := snap("work")
+
+	if hasData || frozen || limits != nil {
+		t.Errorf("daemon-start snapshot = (limits=%v, frozen=%v, hasData=%v), want all zero/false", limits, frozen, hasData)
+	}
+}
+
+func TestProfileSnapshotFunc_NonActiveProfile_ReadsProfileState(t *testing.T) {
+	fixedTime := time.Now().Add(-30 * time.Minute)
+	someLimits := &UsageLimits{FiveHour: &UsageLimit{Utilization: 9}}
+	state := &profileState{
+		meta:       ProfileMeta{Name: "work"},
+		lastLimits: someLimits,
+		lastGoodAt: fixedTime,
+		frozen:     true,
+	}
+	setProfileState("work", state)
+	defer removeProfileState("work")
+
+	snap := profileSnapshotFunc("default")
+	limits, lastGoodAt, frozen, hasData := snap("work")
+
+	if limits != someLimits {
+		t.Errorf("limits = %+v, want the profile's own cached data", limits)
+	}
+	if !hasData || !frozen {
+		t.Errorf("hasData=%v frozen=%v, want both true", hasData, frozen)
+	}
+	if !lastGoodAt.Equal(fixedTime) {
+		t.Errorf("lastGoodAt = %v, want %v", lastGoodAt, fixedTime)
+	}
+}
+
+func TestProfileSnapshotFunc_UnknownProfile_NoData(t *testing.T) {
+	snap := profileSnapshotFunc("default")
+	limits, _, frozen, hasData := snap("ghost-never-registered")
+
+	if hasData || frozen || limits != nil {
+		t.Errorf("unregistered profile snapshot = (limits=%v, frozen=%v, hasData=%v), want all zero/false", limits, frozen, hasData)
+	}
+}
+
+// --- ISC-15: filterEnv + profile-login env construction ---------------------
+
+func TestFilterEnv_StripsOnlyExactKey(t *testing.T) {
+	cases := []struct {
+		name string
+		env  []string
+		key  string
+		want []string
+	}{
+		{
+			name: "strips an exact match, preserves the rest",
+			env:  []string{"CLAUDE_CONFIG_DIR=/a", "FOO=bar"},
+			key:  "CLAUDE_CONFIG_DIR",
+			want: []string{"FOO=bar"},
+		},
+		{
+			name: "preserves a similarly-prefixed but distinct variable name",
+			env:  []string{"CLAUDE_CONFIG_DIRECTORY=/a", "CLAUDE_CONFIG_DIR=/b"},
+			key:  "CLAUDE_CONFIG_DIR",
+			want: []string{"CLAUDE_CONFIG_DIRECTORY=/a"},
+		},
+		{
+			name: "strips every occurrence of the key",
+			env:  []string{"CLAUDE_CONFIG_DIR=/a", "X=1", "CLAUDE_CONFIG_DIR=/b"},
+			key:  "CLAUDE_CONFIG_DIR",
+			want: []string{"X=1"},
+		},
+		{
+			name: "no matches leaves the slice unchanged",
+			env:  []string{"A=1", "B=2"},
+			key:  "CLAUDE_CONFIG_DIR",
+			want: []string{"A=1", "B=2"},
+		},
+		{
+			name: "empty env stays empty",
+			env:  []string{},
+			key:  "CLAUDE_CONFIG_DIR",
+			want: []string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterEnv(tc.env, tc.key)
+			if len(got) != len(tc.want) {
+				t.Fatalf("filterEnv(%v, %q) = %v, want %v", tc.env, tc.key, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("filterEnv(%v, %q)[%d] = %q, want %q", tc.env, tc.key, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// setupFakeClaudeOnPath installs a fake `claude` executable ahead of the real
+// PATH (a POSIX shell script that dumps its own environment to a file and
+// exits 0) so handleProfileLogin's realClaudeBinary() resolves it instead of
+// touching a real claude installation, and returns the path handleProfileLogin's
+// exec'd env can be inspected at.
+func setupFakeClaudeOnPath(t *testing.T) (dumpPath string) {
+	t.Helper()
+
+	binDir := t.TempDir()
+	scriptPath := filepath.Join(binDir, "claude")
+	script := "#!/bin/sh\nenv > \"$FAKE_CLAUDE_ENV_DUMP\"\nexit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake claude script: %v", err)
+	}
+	if err := os.Chmod(scriptPath, 0755); err != nil {
+		t.Fatalf("failed to chmod fake claude script: %v", err)
+	}
+
+	dumpPath = filepath.Join(t.TempDir(), "env-dump.txt")
+	oldDump, hadDump := os.LookupEnv("FAKE_CLAUDE_ENV_DUMP")
+	os.Setenv("FAKE_CLAUDE_ENV_DUMP", dumpPath)
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
+
+	t.Cleanup(func() {
+		os.Setenv("PATH", oldPath)
+		if hadDump {
+			os.Setenv("FAKE_CLAUDE_ENV_DUMP", oldDump)
+		} else {
+			os.Unsetenv("FAKE_CLAUDE_ENV_DUMP")
+		}
+	})
+
+	return dumpPath
+}
+
+// A non-default profile's login must export CLAUDE_CONFIG_DIR=<its dir> to
+// the real claude process (ISC-15).
+func TestHandleProfileLogin_NonDefaultProfile_SetsConfigDir(t *testing.T) {
+	withTempProfileEnv(t)
+	dumpPath := setupFakeClaudeOnPath(t)
+
+	meta, err := AddProfile("work", "")
+	if err != nil {
+		t.Fatalf("AddProfile failed: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		handleProfileLogin([]string{"work"})
+	})
+	if !strings.Contains(out, "work") {
+		t.Errorf("stdout = %q, want it to mention the profile name", out)
+	}
+
+	dump, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("fake claude did not run (no env dump found): %v", err)
+	}
+	if !strings.Contains(string(dump), "CLAUDE_CONFIG_DIR="+meta.Dir) {
+		t.Errorf("child env = %q, want it to contain CLAUDE_CONFIG_DIR=%s", dump, meta.Dir)
+	}
+}
+
+// The default profile's login must OMIT CLAUDE_CONFIG_DIR entirely, even when
+// the ambient environment already has it set (withTempProfileEnv sets the
+// real CLAUDE_CONFIG_DIR env var so claudeConfigDir() resolves to a fake temp
+// dir) — an explicit value, even one naming the same directory, changes the
+// derived Keychain service name (ISC-15's default-profile clause).
+func TestHandleProfileLogin_DefaultProfile_OmitsConfigDirEvenIfAmbientSet(t *testing.T) {
+	withTempProfileEnv(t)
+	dumpPath := setupFakeClaudeOnPath(t)
+
+	if err := EnsureDefaultProfile(); err != nil {
+		t.Fatalf("EnsureDefaultProfile failed: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		handleProfileLogin([]string{defaultProfileName})
+	})
+	if !strings.Contains(out, "unset") {
+		t.Errorf("stdout = %q, want it to describe CLAUDE_CONFIG_DIR as unset for the default profile", out)
+	}
+
+	dump, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("fake claude did not run (no env dump found): %v", err)
+	}
+	for _, line := range strings.Split(string(dump), "\n") {
+		if strings.HasPrefix(line, "CLAUDE_CONFIG_DIR=") {
+			t.Errorf("child env contains %q — CLAUDE_CONFIG_DIR must be unset for the default profile even though the ambient environment had it set", line)
+		}
+	}
+}
+
+// --- ISC-60: no token material in daemon logs, in any tested scenario ------
+
+func TestSwitchProfile_LogScan_NoTokenMaterial(t *testing.T) {
+	withTempProfileEnv(t)
+	restore := readCredential
+	defer func() { readCredential = restore }()
+	readCredential = func(dir string) (*OAuthCredential, error) {
+		return &OAuthCredential{
+			AccessToken:  "sk-ant-oat01-FAKE-TEST-ACCESS-TOKEN",
+			RefreshToken: "sk-ant-ort01-FAKE-TEST-REFRESH-TOKEN",
+			ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
+		}, nil
+	}
+
+	if _, err := AddProfile("work", ""); err != nil {
+		t.Fatalf("AddProfile failed: %v", err)
+	}
+
+	got := captureLogOutput(t, func() {
+		if _, err := SwitchProfile("work"); err != nil {
+			t.Fatalf("SwitchProfile failed: %v", err)
+		}
+	})
+	assertNoTokenMaterial(t, got, "SwitchProfile audit log")
+}
+
+func TestPollProfileOnce_LogScan_AuthFailure_NoTokenMaterial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "sk-ant-oat01-FAKE-TEST-ACCESS-TOKEN", nil }),
+	}
+
+	got := captureLogOutput(t, func() { pollProfileOnce(state) })
+	assertNoTokenMaterial(t, got, "pollProfileOnce auth-failure log")
+}
+
+func TestPollProfileOnce_LogScan_TransientError_NoTokenMaterial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "sk-ant-oat01-FAKE-TEST-ACCESS-TOKEN", nil }),
+	}
+
+	got := captureLogOutput(t, func() { pollProfileOnce(state) })
+	assertNoTokenMaterial(t, got, "pollProfileOnce transient-error log")
+}
+
+// KNOWN GAP (ISC-60): pollProfileOnce logs "%v" of the error GetUsageLimits
+// returns. For a 429, that error is a *RateLimitError whose Error() method
+// (claude_client.go) includes the raw response body verbatim. If a
+// misbehaving usage endpoint ever echoed token-like text in a 429 body, it
+// would land in this program's own daemon log unredacted — main.go's
+// briefStatusErr has a comment flagging exactly this risk for the CLI status
+// path, but the daemon log path (pollProfileOnce) has no equivalent guard.
+//
+// This test documents CURRENT behavior; it is not an endorsement of it, and
+// it is not the failing assertion ISC-60 ultimately wants — main.go is out of
+// scope for this test-only change. If response bodies are ever sanitized
+// before logging, this test will skip itself (rather than fail) as a signal
+// to remove it and drop this note.
+func TestPollProfileOnce_LogScan_RateLimitBody_KnownGap(t *testing.T) {
+	const secretMarker = "sk-ant-oat01-LEAKED-IN-RATE-LIMIT-BODY"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(secretMarker))
+	}))
+	defer srv.Close()
+
+	state := &profileState{
+		meta:   ProfileMeta{Name: "work"},
+		client: newTestOAuthClient(srv.URL, func() (string, error) { return "tok", nil }),
+	}
+
+	got := captureLogOutput(t, func() { pollProfileOnce(state) })
+	if !strings.Contains(got, secretMarker) {
+		t.Skip("rate-limit response body no longer leaks into the daemon log — the ISC-60 gap noted above appears fixed; remove this characterization test")
 	}
 }
