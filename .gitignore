@@ -83,6 +83,10 @@ Temporary Items
 # Project-specific
 claude-monitor-lite
 claude-monitor-lite-*
+
+# Local working notes (never published)
+ISA.md
+todo.md
 *.app
 .claude-monitor-lite.pid
 checksums.txt
