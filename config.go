@@ -35,32 +35,6 @@ type Config struct {
 
 	SavedAt          *time.Time `json:"savedAt,omitempty"`
 	MenuBarIndicator string     `json:"menuBarIndicator"`
-
-	// Profiles registers every known profile — a named, fully isolated
-	// CLAUDE_CONFIG_DIR — by metadata only: name, config directory, and
-	// registration time. No credential material is ever stored here; a
-	// profile's OAuth token lives exclusively in its own config dir's
-	// .credentials.json or (darwin) Keychain item, and is read fresh at
-	// fetch time via ReadClaudeCodeCredentialForDir. Empty/omitted means no
-	// profiles are configured yet, in which case every profile-aware code
-	// path must behave exactly as it did before this feature existed.
-	Profiles []ProfileMeta `json:"profiles,omitempty"`
-
-	// ActiveProfile is the name of the profile new `claude` invocations
-	// should run under (via the shim). Empty means "no profiles configured"
-	// when Profiles is also empty, or "default" when Profiles is non-empty
-	// but no explicit switch has happened yet.
-	ActiveProfile string `json:"activeProfile,omitempty"`
-}
-
-// ProfileMeta is the on-disk record for one profile. It carries no secrets:
-// Dir is a filesystem path, not a credential. The profile's actual OAuth
-// token lives inside Dir (.credentials.json or, on darwin, the Keychain item
-// keyed by Dir's derived service name — see keychainServiceForDir).
-type ProfileMeta struct {
-	Name    string    `json:"name"`
-	Dir     string    `json:"dir"`
-	AddedAt time.Time `json:"addedAt"`
 }
 
 // configPathOverride, when non-empty, is used instead of the default
@@ -109,30 +83,11 @@ func modifyAndSaveConfig(modifier func(*Config)) error {
 }
 
 // modifyAndSaveConfigAt performs a serialized, atomic read-modify-write of the
-// config at path.
+// config at path. It holds both the in-process configWriteMutex and a
+// cross-process advisory file lock (config_lock_unix.go) for the whole
+// cycle, so the daemon (a menu click) and a CLI invocation running as
+// separate OS processes can never clobber each other's update.
 func modifyAndSaveConfigAt(path string, modifier func(*Config)) error {
-	return updateConfigLockedAt(path, func(c *Config) error {
-		modifier(c)
-		return nil
-	}, nil)
-}
-
-// updateConfigLocked is updateConfigLockedAt against the default config path.
-func updateConfigLocked(update func(*Config) error, after func(Config) error) error {
-	return updateConfigLockedAt(GetConfigPath(), update, after)
-}
-
-// updateConfigLockedAt is the core serialized read-modify-write cycle. It
-// holds both the in-process configWriteMutex and a cross-process advisory
-// file lock (config_lock_unix.go) for the whole cycle, so a daemon menu
-// click and a CLI `profile switch` running as separate OS processes can
-// never clobber each other's update (ISC-49, ISC-64).
-//
-// update may reject the cycle by returning an error — nothing is written in
-// that case. after, when non-nil, runs with the lock still held and receives
-// the just-saved config, for follow-on writes that must stay consistent with
-// it (the shim's active-profile state file).
-func updateConfigLockedAt(path string, update func(*Config) error, after func(Config) error) error {
 	configWriteMutex.Lock()
 	defer configWriteMutex.Unlock()
 
@@ -149,21 +104,13 @@ func updateConfigLockedAt(path string, update func(*Config) error, after func(Co
 		}
 	}
 
-	if err := update(&config); err != nil {
-		return err
-	}
+	modifier(&config)
 
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path, data, configFilePermissions); err != nil {
-		return err
-	}
-	if after != nil {
-		return after(config)
-	}
-	return nil
+	return writeFileAtomic(path, data, configFilePermissions)
 }
 
 // writeFileAtomic writes data to a temp file in the same directory and renames
