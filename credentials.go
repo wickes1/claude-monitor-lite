@@ -1,21 +1,16 @@
 // credentials.go - Zero-paste auth by reusing Claude Code's existing login.
 //
-// Claude Code (and the wider Claude CLI ecosystem) stores a subscription OAuth
-// token on disk after the user logs in. We read that credential and poll the
-// same usage endpoint Claude Code uses, so the user never has to copy a session
-// key out of the browser by hand. We never run our own login flow, never proxy
-// inference, and never write back to Claude Code's credential store.
-//
-// The token itself is never persisted to our own config either: the
-// CurrentOAuthToken family below reads it fresh from Claude Code's store on
-// demand and caches it in memory only, for this process's lifetime. Writing a
-// copy of Claude Code's broad-scope credential into our plaintext dotfile
-// would be a downgrade from the Keychain and an unnecessary second copy of
-// the same secret.
+// We read the OAuth credential Claude Code stores after the user logs in and
+// poll the same usage endpoint Claude Code uses. We never run our own login
+// flow, never refresh the token, and never write to Claude Code's credential
+// store. The token is cached in memory only, for this process's lifetime —
+// never copied to our own config.
 package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -27,59 +22,39 @@ import (
 )
 
 const (
-	// keychainService is the macOS Keychain item Claude Code stores its
-	// credential under on newer versions.
-	keychainService = "Claude Code-credentials"
+	// keychainServiceBase is the macOS Keychain item Claude Code stores its
+	// credential under (see keychainService for the CLAUDE_CONFIG_DIR form).
+	keychainServiceBase = "Claude Code-credentials"
 
 	// tokenRefreshLeeway is how far before expiry a token is treated as stale,
 	// so a poll never races the expiry boundary.
 	tokenRefreshLeeway = 2 * time.Minute
 )
 
-// oauthTokenMu guards cachedOAuthCredential. CurrentOAuthToken and
-// InvalidateOAuthToken are the only code that may touch it. The cache lives
-// in memory for this process only — it is never marshaled to our config
-// file, so a compromised dotfile can no longer impersonate Claude Code's own
-// broad-scope subscription credential.
 var (
-	oauthTokenMu sync.Mutex
-
-	// cachedOAuthCredential holds the credential read from Claude Code's store,
-	// for this process's lifetime.
+	// oauthTokenMu guards cachedOAuthCredential.
+	oauthTokenMu          sync.Mutex
 	cachedOAuthCredential *OAuthCredential
 
-	// readCredential indirects ReadClaudeCodeCredential so tests can
-	// substitute a fake without touching the real Keychain or credentials
-	// file.
+	// readCredential indirects ReadClaudeCodeCredential so tests can substitute
+	// a fake without touching the real Keychain or credentials file.
 	readCredential = ReadClaudeCodeCredential
-
-	// fileReader and keychainReader further indirect the two underlying
-	// resolution steps, so tests can exercise the file fallback and the
-	// typed failure independently without invoking a real `security`
-	// process or touching a real credentials file.
-	fileReader     = readCredentialFile
-	keychainReader = readCredentialKeychain
 )
 
-// OAuthCredential is the claudeAiOauth block Claude Code persists.
+// OAuthCredential is the part of Claude Code's claudeAiOauth block we use.
 type OAuthCredential struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ExpiresAt    int64  `json:"expiresAt"` // epoch milliseconds
+	AccessToken string `json:"accessToken"`
+	ExpiresAt   int64  `json:"expiresAt"` // epoch milliseconds
 }
 
 // expired reports whether the access token is within the refresh leeway of (or
-// past) its expiry. An unknown expiry (0) is treated as usable; a 401 will
-// trigger a reactive refresh if it has in fact expired.
+// past) its expiry. An unknown expiry (0) is treated as usable; a 401 then
+// triggers a re-read.
 func (c *OAuthCredential) expired() bool {
 	if c.ExpiresAt == 0 {
 		return false
 	}
 	return time.Now().Add(tokenRefreshLeeway).After(time.UnixMilli(c.ExpiresAt))
-}
-
-type claudeCredentialsFile struct {
-	ClaudeAiOauth *OAuthCredential `json:"claudeAiOauth"`
 }
 
 // claudeConfigDir returns Claude Code's config directory, honoring the same
@@ -93,48 +68,57 @@ func claudeConfigDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-// ReadClaudeCodeCredential reads Claude Code's existing OAuth credential. It
-// tries the credentials file first (Linux, Windows, and older macOS), then
-// the macOS Keychain. A missing credential means Claude Code has not been
-// logged in, which callers treat as a "needs login" state — never a fatal
-// error.
-func ReadClaudeCodeCredential() (*OAuthCredential, error) {
-	dir := claudeConfigDir()
-	if cred, err := fileReader(dir); err == nil {
-		return cred, nil
+// keychainService mirrors how Claude Code names its Keychain item: the plain
+// name when CLAUDE_CONFIG_DIR is unset, and
+// "<name>-<sha256(cleaned absolute dir)[:8] hex>" whenever it is set — even if
+// it points at ~/.claude. Reading the plain item for a CLAUDE_CONFIG_DIR
+// environment would silently report the default account's usage instead.
+func keychainService() string {
+	if os.Getenv("CLAUDE_CONFIG_DIR") == "" {
+		return keychainServiceBase
 	}
-	if runtime.GOOS == "darwin" {
-		if cred, err := keychainReader(dir); err == nil {
-			return cred, nil
-		}
-	}
-	return nil, fmt.Errorf("no Claude Code credential found for %s — install Claude Code and log in once", dir)
+	return keychainServiceBase + "-" + configDirHash()
 }
 
-func readCredentialFile(dir string) (*OAuthCredential, error) {
-	path := filepath.Join(dir, ".credentials.json")
+// configDirHash is Claude Code's 8-hex-char hash of the cleaned absolute
+// CLAUDE_CONFIG_DIR. It identifies the environment however the path was
+// spelled (relative, trailing slash, ".." segments).
+func configDirHash() string {
+	sum := sha256.Sum256([]byte(absConfigDir()))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+func absConfigDir() string {
+	dir := claudeConfigDir()
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return filepath.Clean(dir)
+}
+
+// ReadClaudeCodeCredential reads Claude Code's OAuth credential from where
+// Claude Code keeps it: the Keychain on macOS, <config dir>/.credentials.json
+// on Linux. A missing credential means Claude Code is not logged in.
+func ReadClaudeCodeCredential() (*OAuthCredential, error) {
+	if runtime.GOOS == "darwin" {
+		out, err := exec.Command("security", "find-generic-password", "-s", keychainService(), "-w").Output()
+		if err != nil {
+			return nil, fmt.Errorf("no Claude Code login in Keychain item %q — log in to Claude Code first", keychainService())
+		}
+		return parseCredential(bytes.TrimSpace(out))
+	}
+	path := filepath.Join(claudeConfigDir(), ".credentials.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("no Claude Code login at %s — log in to Claude Code first", path)
 	}
 	return parseCredential(data)
 }
 
-// readCredentialKeychain shells out to `security`, matching how the rest of
-// the macOS ecosystem reads this item. The first read shows a Keychain
-// prompt; once the user clicks "Always Allow" this binary is added to the
-// item's ACL and subsequent reads are silent. Read-only: this never writes,
-// updates, or deletes a Keychain item.
-func readCredentialKeychain(string) (*OAuthCredential, error) {
-	out, err := exec.Command("security", "find-generic-password", "-s", keychainService, "-w").Output()
-	if err != nil {
-		return nil, err
-	}
-	return parseCredential(bytes.TrimSpace(out))
-}
-
 func parseCredential(data []byte) (*OAuthCredential, error) {
-	var f claudeCredentialsFile
+	var f struct {
+		ClaudeAiOauth *OAuthCredential `json:"claudeAiOauth"`
+	}
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("parse credential: %w", err)
 	}
@@ -144,24 +128,15 @@ func parseCredential(data []byte) (*OAuthCredential, error) {
 	return f.ClaudeAiOauth, nil
 }
 
-// CurrentOAuthToken returns a currently-valid Claude Code OAuth access
-// token. It never touches our own config file — the token is cached in
-// memory only, for this process's lifetime.
+// CurrentOAuthToken returns a currently-valid Claude Code OAuth access token:
+// the cached one while it is unexpired, otherwise a fresh read of Claude
+// Code's credential. Claude Code refreshes its own token in the background,
+// so a fresh read is what keeps this working.
 //
-// Resolution order:
-//  1. A cached, non-expired credential is returned as-is.
-//  2. Otherwise the on-disk credential is re-read. Claude Code refreshes its
-//     own token in the background, so a fresh read is what keeps this
-//     working — we never spend Claude Code's refresh grant ourselves,
-//     because rotating its refresh token could force the user to sign back
-//     into Claude Code.
-//  3. If that re-read credential is itself expired, we report a transient
-//     error and wait for Claude Code to refresh it, rather than refreshing
-//     on its behalf.
-//
-// Returns ErrTransient when the credential is present but expired; returns
-// the underlying read error if the credential store could not be read at all
-// (Claude Code not installed, or never logged in).
+// If the fresh read is itself expired we report ErrTransient and wait. We
+// never spend the refresh token: the OAuth server rotates refresh tokens on
+// use, so refreshing here would consume Claude Code's grant and could force
+// the user to sign back into Claude Code.
 func CurrentOAuthToken() (string, error) {
 	oauthTokenMu.Lock()
 	defer oauthTokenMu.Unlock()
@@ -174,23 +149,16 @@ func CurrentOAuthToken() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !cred.expired() {
-		cachedOAuthCredential = cred
-		return cred.AccessToken, nil
+	if cred.expired() {
+		return "", fmt.Errorf("%w: Claude Code's access token is expired; waiting for it to refresh", ErrTransient)
 	}
-
-	// The access token is expired. We deliberately do NOT spend the refresh
-	// token: the OAuth server rotates refresh tokens on use, so refreshing
-	// here would consume Claude Code's grant and could force the user to
-	// sign back into Claude Code. Wait for Claude Code to refresh its own
-	// credential and report transient so the caller keeps last-good data.
-	return "", fmt.Errorf("%w: Claude Code's access token is expired; waiting for it to refresh", ErrTransient)
+	cachedOAuthCredential = cred
+	return cred.AccessToken, nil
 }
 
-// InvalidateOAuthToken drops the in-memory cached credential. Call it after
-// an API request rejects the current token (a 401), so the next
-// CurrentOAuthToken call re-reads instead of handing out the same token the
-// server just refused.
+// InvalidateOAuthToken drops the cached credential. Call it after the server
+// rejects the current token (a 401), so the next CurrentOAuthToken re-reads
+// instead of handing out the token the server just refused.
 func InvalidateOAuthToken() {
 	oauthTokenMu.Lock()
 	defer oauthTokenMu.Unlock()

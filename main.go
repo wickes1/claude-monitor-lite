@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +20,12 @@ import (
 )
 
 const (
-	refreshInterval    = 60 * time.Second  // base poll interval; 30s was too aggressive for oauth/usage (persistent 429)
+	// Base poll interval. oauth/usage rate-limits non-Claude-Code clients per
+	// account: on a Max account a 60s poll got 429 on every second request
+	// (roughly one request per ~2min allowed), while a Team account took 60s
+	// fine. 180s clears the strictest observed limit with jitter headroom and
+	// matches ccstatusline's cache age for the same endpoint.
+	refreshInterval    = 180 * time.Second
 	maxBackoffInterval = 300 * time.Second // cap when the endpoint rate-limits us (429)
 	pidCheckTimeout    = 500 * time.Millisecond
 	pidFilePermissions = 0644 // Owner read/write, others read
@@ -38,23 +43,16 @@ var (
 	// indicators table. Populated once in onReady.
 	indicatorMenuItems []*systray.MenuItem
 
-	// Refresh button
-	mRefresh *systray.MenuItem
-
-	// App config
 	appConfig    Config
 	pidFile      string
 	claudeClient *ClaudeUsageClient
 
-	// Guards appConfig.MenuBarIndicator — written by menu clicks (event loop),
-	// read by the update worker.
+	// Guards appConfig — written by menu clicks, read by the update worker.
 	indicatorMutex sync.RWMutex
 
-	// Last fetched limits for instant display switching, and when they were
-	// fetched. Both fields are protected by limitsMutex.
-	lastLimits   *UsageLimits
-	lastLimitsAt time.Time
-	limitsMutex  sync.RWMutex
+	// Last fetched limits, for instant display switching. Guarded by limitsMutex.
+	lastLimits  *UsageLimits
+	limitsMutex sync.RWMutex
 
 	// Consecutive error tracking for transient error resilience. Both counters
 	// are guarded by consecutiveMutex.
@@ -77,21 +75,10 @@ type indicator struct {
 	get   func(*UsageLimits) *UsageLimit
 }
 
-// indicators lists every metric the usage API returns, in API response order.
+// indicators lists the selectable metrics; the first is the default.
 var indicators = []indicator{
 	{"currentSession", "5-Hour Session", func(u *UsageLimits) *UsageLimit { return u.FiveHour }},
 	{"weeklyAll", "Weekly (All)", func(u *UsageLimits) *UsageLimit { return u.SevenDay }},
-	{"weeklyOAuthApps", "Weekly (OAuth Apps)", func(u *UsageLimits) *UsageLimit { return u.SevenDayOAuthApps }},
-	{"weeklyOpus", "Weekly (Opus)", func(u *UsageLimits) *UsageLimit { return u.SevenDayOpus }},
-	{"weeklySonnet", "Weekly (Sonnet)", func(u *UsageLimits) *UsageLimit { return u.SevenDaySonnet }},
-	{"weeklyCowork", "Weekly (Cowork)", func(u *UsageLimits) *UsageLimit { return u.SevenDayCowork }},
-	{"weeklyDesign", "Weekly (Design)", func(u *UsageLimits) *UsageLimit { return u.SevenDayOmelette }},
-	{"tangelo", "Tangelo", func(u *UsageLimits) *UsageLimit { return u.Tangelo }},
-	{"iguanaNecktie", "Iguana Necktie", func(u *UsageLimits) *UsageLimit { return u.IguanaNecktie }},
-	{"designPromotional", "Design (Promotional)", func(u *UsageLimits) *UsageLimit { return u.OmelettePromotional }},
-	{"nimbusQuill", "Nimbus Quill", func(u *UsageLimits) *UsageLimit { return u.NimbusQuill }},
-	{"cinderCove", "Cinder Cove", func(u *UsageLimits) *UsageLimit { return u.CinderCove }},
-	{"amberLadder", "Amber Ladder", func(u *UsageLimits) *UsageLimit { return u.AmberLadder }},
 	{"extraUsage", "Extra Usage", extraUsageWindow},
 }
 
@@ -105,50 +92,21 @@ func extraUsageWindow(u *UsageLimits) *UsageLimit {
 	return &UsageLimit{Utilization: *u.ExtraUsage.Utilization}
 }
 
-// findIndicator returns the indicator for key, falling back to the first
-// (default) entry when key is unknown.
-func findIndicator(key string) indicator {
+// findIndicator returns the indicator for key, or the first (default) entry
+// and false when key is unknown.
+func findIndicator(key string) (indicator, bool) {
 	for i := range indicators {
 		if indicators[i].key == key {
-			return indicators[i]
+			return indicators[i], true
 		}
 	}
-	return indicators[0]
+	return indicators[0], false
 }
 
-// isValidIndicator reports whether key names a known indicator.
-func isValidIndicator(key string) bool {
-	for i := range indicators {
-		if indicators[i].key == key {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper function to create Claude client from session
-func createClientFromSession(session *AuthSession) *ClaudeUsageClient {
-	if session.AuthMode == AuthModeOAuth {
-		return NewOAuthUsageClient(CurrentOAuthToken)
-	}
-	if session.OrganizationID != "" {
-		return NewClaudeUsageClientWithOrg(session.SessionKey, session.OrganizationID)
-	}
-	return NewClaudeUsageClient(session.SessionKey)
-}
-
-// getMenuBarIndicator and setMenuBarIndicator guard appConfig.MenuBarIndicator,
-// which is written by menu clicks (event loop) and read by the update worker.
 func getMenuBarIndicator() string {
 	indicatorMutex.RLock()
 	defer indicatorMutex.RUnlock()
 	return appConfig.MenuBarIndicator
-}
-
-func setMenuBarIndicator(key string) {
-	indicatorMutex.Lock()
-	appConfig.MenuBarIndicator = key
-	indicatorMutex.Unlock()
 }
 
 // Helper function to round utilization to nearest integer
@@ -219,7 +177,7 @@ func formatUsageWithReset(limit *UsageLimit, label string) string {
 	}
 
 	utilization := roundUtilization(limit.Utilization)
-	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAtTime)
+	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAt)
 
 	// Special case: no active session (0% with no reset time)
 	if !hasTime && utilization == 0 {
@@ -228,7 +186,7 @@ func formatUsageWithReset(limit *UsageLimit, label string) string {
 
 	if hasTime {
 		return fmt.Sprintf("%s %d%% (resets %s, in %dh %dm)",
-			label, utilization, formatResetTime(limit.ResetsAtTime), hours, minutes)
+			label, utilization, formatResetTime(limit.ResetsAt), hours, minutes)
 	}
 
 	return fmt.Sprintf("%s %d%%", label, utilization)
@@ -241,11 +199,11 @@ func formatConsoleUsage(limit *UsageLimit, label string, noSessionMsg string) st
 	}
 
 	utilization := roundUtilization(limit.Utilization)
-	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAtTime)
+	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAt)
 
 	if hasTime {
 		return fmt.Sprintf("%s  %3d%%  (resets %s, in %dh %dm)\n",
-			label, utilization, formatResetTime(limit.ResetsAtTime), hours, minutes)
+			label, utilization, formatResetTime(limit.ResetsAt), hours, minutes)
 	}
 
 	if noSessionMsg != "" {
@@ -254,12 +212,7 @@ func formatConsoleUsage(limit *UsageLimit, label string, noSessionMsg string) st
 	return fmt.Sprintf("%s  %3d%%\n", label, utilization)
 }
 
-// Helper function to get the selected limit based on indicator setting
-func getSelectedLimit(limits *UsageLimits, indicatorKey string) *UsageLimit {
-	return findIndicator(indicatorKey).get(limits)
-}
-
-// scopedLimitLabel builds the console label for a model/surface-scoped
+// scopedLimitLabel builds the console label for a model-scoped
 // limits[] entry, e.g. "Weekly (Fable)". It prefers the model display name,
 // falls back to the model ID, and finally to a generic "Scoped" label when
 // neither is present.
@@ -275,20 +228,11 @@ func scopedLimitLabel(entry LimitEntry) string {
 	return "Weekly (Scoped)"
 }
 
-// scopedLimitToUsageLimit adapts a limits[] entry to the UsageLimit shape so
-// it can be rendered with the existing formatConsoleUsage helper.
-func scopedLimitToUsageLimit(entry LimitEntry) *UsageLimit {
-	return &UsageLimit{
-		Utilization:  entry.Percent,
-		ResetsAt:     entry.ResetsAt,
-		ResetsAtTime: entry.ResetsAtTime,
-	}
-}
-
-// formatScopedLimitLine renders one model/surface-scoped limits[] entry as a
-// console line, in the same format as formatConsoleUsage.
+// formatScopedLimitLine renders one model-scoped limits[] entry as a console
+// line, in the same format as formatConsoleUsage.
 func formatScopedLimitLine(entry LimitEntry) string {
-	return formatConsoleUsage(scopedLimitToUsageLimit(entry), scopedLimitLabel(entry)+":", "")
+	limit := &UsageLimit{Utilization: entry.Percent, ResetsAt: entry.ResetsAt}
+	return formatConsoleUsage(limit, scopedLimitLabel(entry)+":", "")
 }
 
 // Helper function to display usage stats. Windows with no data are skipped to
@@ -308,107 +252,54 @@ func displayUsageStats(limits *UsageLimits) {
 		}
 		fmt.Print(formatConsoleUsage(limit, indicators[i].label+":", noSessionMsg))
 	}
-	// Scoped limits (e.g. a weekly window narrowed to one model) are display
-	// only — they are not selectable indicators and never touch config
-	// validation or persistence. Unscoped entries (session, weekly_all) merely
-	// duplicate five_hour/seven_day already shown above, so only scoped
-	// entries are printed here.
-	if limits != nil {
-		for _, entry := range limits.Limits {
-			if entry.Scope != nil {
-				fmt.Print(formatScopedLimitLine(entry))
-			}
+	// Scoped limits (a weekly window narrowed to one model) are display only,
+	// not selectable indicators.
+	for _, entry := range limits.Limits {
+		if entry.Scope != nil {
+			fmt.Print(formatScopedLimitLine(entry))
 		}
 	}
 	fmt.Println()
 }
 
+// setMenuBarTitle prefixes the title with the instance name so side-by-side
+// monitors (one per CLAUDE_CONFIG_DIR) are told apart at a glance.
+func setMenuBarTitle(title string) {
+	if name := instanceName(); name != "" {
+		title = name + " " + title
+	}
+	systray.SetTitle(title)
+}
+
 // Helper function to update menu bar display
 func updateMenuBarDisplay(limits *UsageLimits) {
-	limit := getSelectedLimit(limits, getMenuBarIndicator())
+	selected, _ := findIndicator(getMenuBarIndicator())
+	limit := selected.get(limits)
 
 	if limit == nil {
-		systray.SetTitle("⚪ --")
+		setMenuBarTitle("⚪ --")
 		return
 	}
 
 	utilization := roundUtilization(limit.Utilization)
-	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAtTime)
+	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAt)
 	color := getColorIndicator(limit.Utilization)
 
 	if hasTime {
-		systray.SetTitle(fmt.Sprintf("%s %d%% (%dh%dm)", color, utilization, hours, minutes))
+		setMenuBarTitle(fmt.Sprintf("%s %d%% (%dh%dm)", color, utilization, hours, minutes))
 	} else {
-		systray.SetTitle(fmt.Sprintf("%s %d%%", color, utilization))
-	}
-}
-
-// migrateStripLegacySecrets rewrites the config file once if it still carries
-// a plaintext OAuth token from a version predating this security fix — the
-// access/refresh token used to be copied from Claude Code's credential store
-// into our own config; it now lives only in memory (see CurrentOAuthToken in
-// credentials.go). Config no longer declares those fields, so re-marshaling
-// the already-parsed struct is enough to drop them. A no-op if the config
-// file is absent or already clean, so this costs one read on every normal
-// startup.
-func migrateStripLegacySecrets() {
-	data, err := os.ReadFile(GetConfigPath())
-	if err != nil {
-		return // no config file yet - nothing to migrate
-	}
-
-	raw := string(data)
-	hasLegacySecret := strings.Contains(raw, "accessToken") ||
-		strings.Contains(raw, "refreshToken") ||
-		strings.Contains(raw, "expiresAt")
-	if !hasLegacySecret {
-		return
-	}
-
-	if err := modifyAndSaveConfig(func(c *Config) {}); err != nil {
-		log.Printf("Failed to migrate legacy plaintext token out of config: %v", err)
-	}
-}
-
-// redactedFetchErr renders a fetch error for log output. A raw error can
-// embed an HTTP response body verbatim (RateLimitError keeps it for
-// diagnostics), and a response body is not guaranteed token-free — so the
-// daemon log gets only a classification plus token-free metadata, never the
-// raw error.
-func redactedFetchErr(err error) string {
-	var rl *RateLimitError
-	if errors.As(err, &rl) {
-		if rl.RetryAfter > 0 {
-			return fmt.Sprintf("rate limited (status %d), retry after %s", rl.StatusCode, rl.RetryAfter)
-		}
-		return fmt.Sprintf("rate limited (status %d)", rl.StatusCode)
-	}
-	return briefStatusErr(err)
-}
-
-// briefStatusErr renders a fetch error without ever including a raw HTTP
-// response body (which, unlike this program's own error messages, is not
-// guaranteed token-free).
-func briefStatusErr(err error) string {
-	switch {
-	case errors.Is(err, ErrAuthFailed):
-		return "authentication failed"
-	case errors.Is(err, ErrTransient):
-		return "temporarily unavailable"
-	default:
-		return "fetch error"
+		setMenuBarTitle(fmt.Sprintf("%s %d%%", color, utilization))
 	}
 }
 
 func main() {
-	appConfig = LoadConfig()
-	migrateStripLegacySecrets()
-
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	// Every dotfile path hangs off the home directory; without it they would
+	// silently resolve relative to the working directory.
+	if _, err := os.UserHomeDir(); err != nil {
 		log.Fatal("Failed to get home directory:", err)
 	}
-	pidFile = filepath.Join(homeDir, ".claude-monitor-lite.pid")
+	appConfig = LoadConfig()
+	pidFile = instanceFile(".pid")
 
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -416,8 +307,6 @@ func main() {
 			handleAutoStart()
 		case "stop":
 			handleStop()
-		case "logout":
-			handleLogout()
 		case "install":
 			handleInstall()
 		case "uninstall":
@@ -444,127 +333,31 @@ func printUsage() {
 	fmt.Printf("Claude Monitor Lite %s - Menu bar monitor for Claude usage\n", version)
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  claude-monitor-lite              Start monitor (login if needed, show status if running)")
+	fmt.Println("  claude-monitor-lite              Start monitor (show status if running)")
 	fmt.Println("  claude-monitor-lite start        Same as above")
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
-	fmt.Println("  claude-monitor-lite logout       Clear session and stop monitor")
 	fmt.Println("  claude-monitor-lite install      Start automatically at login (LaunchAgent)")
 	fmt.Println("  claude-monitor-lite uninstall    Stop starting automatically at login")
 	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
 	fmt.Println()
-	fmt.Println("First time? Just run: claude-monitor-lite")
+	fmt.Println("Reads your Claude Code login; set CLAUDE_CONFIG_DIR to watch another environment.")
 }
 
+// handleAutoStart shows status if the monitor is running, otherwise starts it.
+// A missing Claude Code login is reported here, at the terminal, rather than
+// as a menu bar that can only say "Login".
 func handleAutoStart() {
-	// Check authentication first
-	_, err := LoadAuthSession()
-	if err != nil {
-		// Not logged in - run login flow
-		fmt.Println("⚠️  Not authenticated")
-		fmt.Println()
-		_, err = handleLoginFlow()
-		if err != nil {
-			os.Exit(1)
-		}
-	}
-
-	// Check if already running
 	if isRunning() {
-		// Already running - show status
 		handleStatusDisplay()
 		return
 	}
-
-	// Not running - show current usage then start it
-	session, err := LoadAuthSession()
-	if err == nil {
-		client := createClientFromSession(session)
-		if limits, err := client.GetUsageLimits(); err == nil {
-			displayUsageStats(limits)
-		}
+	if _, err := readCredential(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
 	}
-
 	fmt.Println("⚙️  Starting Claude Monitor Lite...")
-	fmt.Println()
 	handleStart()
-}
-
-// loginValidationAttempts and loginRetryDelay control how hard the login flow
-// tries to validate a freshly entered key before giving up.
-const (
-	loginValidationAttempts = 3
-	loginRetryDelay         = 1 * time.Second
-)
-
-// validateSession checks that a session key works, retrying on transient
-// failures (Cloudflare interstitials, network blips) so a momentary hiccup
-// does not reject a valid key. A real auth failure returns immediately.
-func validateSession(client *ClaudeUsageClient, attempts int, delay time.Duration) error {
-	var err error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		err = client.TestSession()
-		if err == nil || errors.Is(err, ErrSessionExpired) {
-			return err
-		}
-		if attempt < attempts {
-			time.Sleep(delay)
-		}
-	}
-	return err
-}
-
-func handleLoginFlow() (*AuthSession, error) {
-	// Zero-paste path: reuse Claude Code's existing login if present.
-	if session, err := LoginWithClaudeCode(); err == nil {
-		fmt.Println("✓ Connected using your Claude Code login — no copy-paste needed.")
-		fmt.Println()
-		if limits, err := createClientFromSession(session).GetUsageLimits(); err != nil {
-			fmt.Printf("Note: Could not fetch usage data: %v\n", err)
-			fmt.Println()
-		} else {
-			displayUsageStats(limits)
-		}
-		return session, nil
-	} else {
-		fmt.Printf("Claude Code login not found (%v).\n", err)
-		fmt.Println("Falling back to manual session key entry.")
-		fmt.Println()
-	}
-
-	// Fallback: manual sessionKey paste.
-	session, err := LoginWithBrowser()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Login failed: %v\n", err)
-		return nil, err
-	}
-
-	// Test the session and fetch organization ID
-	client := NewClaudeUsageClient(session.SessionKey)
-	if err := validateSession(client, loginValidationAttempts, loginRetryDelay); err != nil {
-		fmt.Fprintf(os.Stderr, "Session validation failed: %v\n", err)
-		fmt.Println("The session key may be invalid. Please try again.")
-		return nil, err
-	}
-
-	// Save the organization ID
-	session.OrganizationID = client.organizationID
-	if err := SaveAuthSession(session); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to save organization ID: %v\n", err)
-	}
-
-	fmt.Println("✓ Session validated successfully!")
-	fmt.Println()
-
-	// Fetch and display current usage
-	if limits, err := client.GetUsageLimits(); err != nil {
-		fmt.Printf("Note: Could not fetch usage data: %v\n", err)
-		fmt.Println()
-	} else {
-		displayUsageStats(limits)
-	}
-
-	return session, nil
 }
 
 func handleStatusDisplay() {
@@ -572,26 +365,25 @@ func handleStatusDisplay() {
 	fmt.Printf("✓ Already running (PID: %d)\n", pid)
 	fmt.Println()
 
-	// Load session
-	session, err := LoadAuthSession()
+	path := instanceFile(".usage.json")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Println("❌ Not authenticated. Run 'claude-monitor-lite logout' then restart.")
+		fmt.Println("No usage fetched yet — check the menu bar in a moment.")
+		return
+	}
+	var limits *UsageLimits
+	if err := json.Unmarshal(data, &limits); err != nil {
+		fmt.Fprintf(os.Stderr, "Unreadable usage cache %s: %v\n", path, err)
 		os.Exit(1)
 	}
-
-	client := createClientFromSession(session)
-	limits, err := client.GetUsageLimits()
-	if err != nil {
-		fmt.Printf("Error loading usage data: %v\n", err)
-		fmt.Println("Try running 'claude-monitor-lite logout' then restart.")
-		os.Exit(1)
+	if info, err := os.Stat(path); err == nil {
+		fmt.Printf("As of %s:\n", info.ModTime().Format("15:04"))
 	}
 
 	displayUsageStats(limits)
 
 	// Show which indicator is displayed in menu bar
-	selected := findIndicator(getMenuBarIndicator())
-
+	selected, _ := findIndicator(getMenuBarIndicator())
 	limit := selected.get(limits)
 	utilization := 0.0
 	if limit != nil {
@@ -651,26 +443,6 @@ func handleStop() {
 	}
 }
 
-func handleLogout() {
-	// Stop daemon if running
-	if pid, ok := readValidPID(); ok {
-		fmt.Println("Stopping monitor...")
-		process, _ := os.FindProcess(pid) // never errors on Unix
-		process.Signal(syscall.SIGTERM)
-		time.Sleep(pidCheckTimeout)
-		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Warning: Failed to remove PID file: %v\n", err)
-		}
-	}
-
-	// Clear session data only (preserves menu bar settings)
-	if err := ClearAuthSession(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to clear session: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("✓ Logged out! Session data cleared.")
-}
-
 // isOurProcess reports whether pid belongs to a live claude-monitor-lite
 // process. os.FindProcess never fails on Unix and PIDs are recycled, so a
 // bare liveness check (Signal 0) can return a false positive for an unrelated
@@ -724,14 +496,9 @@ func createPIDFile() error {
 // setupDaemonLogging routes the daemon's log output to a file. The daemon runs
 // detached with no terminal attached, so otherwise every log line (transient
 // errors, fetch failures) is discarded and the process cannot be diagnosed
-// after the fact. Logs go to ~/.claude-monitor-lite.log.
+// after the fact. Logs go to this instance's ~/.claude-monitor-lite*.log.
 func setupDaemonLogging() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	logPath := filepath.Join(homeDir, ".claude-monitor-lite.log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
+	f, err := os.OpenFile(instanceFile(".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
 	if err != nil {
 		return
 	}
@@ -756,37 +523,10 @@ func onReady() {
 	// Create context for graceful shutdown
 	appCtx, appCancel = context.WithCancel(context.Background())
 
-	systray.SetTitle("⚪ Loading...")
-	systray.SetTooltip("Claude Monitor Lite")
+	setMenuBarTitle("⚪ Loading...")
+	systray.SetTooltip(strings.TrimSpace("Claude Monitor Lite " + instanceName()))
 
-	// Check authentication. With no stored session, try the zero-paste Claude
-	// Code path before asking the user to do anything.
-	session, err := LoadAuthSession()
-	if err != nil {
-		if s, e := LoginWithClaudeCode(); e == nil {
-			session, err = s, nil
-		} else {
-			// Daemon has no terminal, so log why auto-login fell through.
-			log.Printf("Claude Code auto-login unavailable: %v", e)
-		}
-	}
-	if err != nil {
-		systray.SetTitle("⚪ Not logged in")
-		mLogin := systray.AddMenuItem("⚠️  Please login first", "Login required")
-		mLogin.Disable()
-		systray.AddSeparator()
-		mQuit := systray.AddMenuItem("Quit", "Quit the application")
-
-		go func() {
-			<-mQuit.ClickedCh
-			systray.Quit()
-		}()
-
-		fmt.Println("ERROR: Not authenticated. Please run 'claude-monitor-lite' to login first.")
-		return
-	}
-
-	claudeClient = createClientFromSession(session)
+	claudeClient = NewUsageClient(CurrentOAuthToken)
 
 	indicatorMenuItems = make([]*systray.MenuItem, len(indicators))
 	for i := range indicators {
@@ -794,8 +534,7 @@ func onReady() {
 	}
 	systray.AddSeparator()
 
-	mRefresh = systray.AddMenuItem("Refresh Now", "Refresh usage data")
-	mOpenConfig := systray.AddMenuItem("Open Config", "Open config file in editor")
+	mRefresh := systray.AddMenuItem("Refresh Now", "Refresh usage data")
 	mAbout := systray.AddMenuItem("About", "Show version info")
 	systray.AddSeparator()
 
@@ -834,8 +573,6 @@ func onReady() {
 				return
 			case <-mRefresh.ClickedCh:
 				requestRefresh()
-			case <-mOpenConfig.ClickedCh:
-				go openConfigFile()
 			case <-mAbout.ClickedCh:
 				go showAboutDialog()
 			}
@@ -846,7 +583,14 @@ func onReady() {
 // selectIndicator switches which usage metric the menu bar shows, updating the
 // display immediately from cached data so the click feels instant.
 func selectIndicator(key string) {
-	setMenuBarIndicator(key)
+	// Saving under the same lock keeps rapid clicks from persisting out of order.
+	indicatorMutex.Lock()
+	appConfig.MenuBarIndicator = key
+	err := SaveConfig(appConfig)
+	indicatorMutex.Unlock()
+	if err != nil {
+		log.Printf("Failed to save menu bar indicator: %v", err)
+	}
 	updateMenuCheckmarks()
 
 	limitsMutex.RLock()
@@ -857,19 +601,6 @@ func selectIndicator(key string) {
 		// the newly selected one must show even if it has no data.
 		applyIndicatorMenu(cached)
 		updateMenuBarDisplay(cached)
-	}
-
-	go func() {
-		if err := SaveConfigPreservingSession(key); err != nil {
-			log.Printf("Failed to save menu bar indicator: %v", err)
-		}
-	}()
-}
-
-// openConfigFile opens the config file in the user's default editor.
-func openConfigFile() {
-	if err := exec.Command("open", GetConfigPath()).Start(); err != nil {
-		log.Printf("Failed to open config file: %v", err)
 	}
 }
 
@@ -912,7 +643,7 @@ func applyIndicatorMenu(limits *UsageLimits) {
 }
 
 // maxTransientErrors is the number of consecutive transient failures tolerated
-// before showing an error in the menu bar. At 60s intervals, 3 = ~3 minutes.
+// before showing an error in the menu bar — about 9 minutes at refreshInterval.
 const maxTransientErrors = 3
 
 // updateAction is how the menu bar should react to a failed usage fetch.
@@ -925,20 +656,28 @@ const (
 )
 
 // classifyUpdate decides how the menu bar should react to a failed usage fetch,
-// given the error and how many consecutive failures have occurred.
-func classifyUpdate(err error, consecutiveCount int) updateAction {
-	if errors.Is(err, ErrAuthFailed) {
+// given the error, how many consecutive failures have occurred, and whether
+// last-good data is cached.
+//
+// Being rate-limited keeps the last-good numbers for as long as it lasts: the
+// backoff recovers on its own, and "Error" would only alarm a user whose
+// account is fine. Any other transient failure (expired token, outage) gets
+// maxTransientErrors polls of grace and then shows "Error", so the menu bar
+// never presents frozen numbers as current.
+func classifyUpdate(err error, consecutiveCount int, haveCache bool) updateAction {
+	var rl *RateLimitError
+	switch {
+	case errors.Is(err, ErrAuthFailed):
 		return actionShowAuth
-	}
-	if errors.Is(err, ErrTransient) && consecutiveCount <= maxTransientErrors {
+	case errors.As(err, &rl) && haveCache:
+		return actionKeepStale
+	case errors.Is(err, ErrTransient) && consecutiveCount <= maxTransientErrors:
 		return actionKeepStale
 	}
 	return actionShowError
 }
 
-// haveLastLimits reports whether a previous successful fetch is cached, so a
-// rate-limited poll can serve stale data instead of falling through to the
-// error state.
+// haveLastLimits reports whether a previous successful fetch is cached.
 func haveLastLimits() bool {
 	limitsMutex.RLock()
 	defer limitsMutex.RUnlock()
@@ -971,8 +710,8 @@ func nextPollDelay(base, max time.Duration, rateLimitFailures int, retryAfter ti
 // of the delay itself (0.10 = ±10%).
 const pollJitterFraction = 0.10
 
-// withJitter spreads a delay by ±10% so many monitors (and Claude Code's own
-// usage polls, which share the same rate-limit budget) don't beat in lockstep.
+// withJitter spreads a delay by ±10% so monitors polling the same account don't
+// beat in lockstep.
 func withJitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return d
@@ -1029,18 +768,11 @@ func runUpdateWorker(ctx context.Context) {
 // success or on a non-rate-limit error, or a value backed off toward
 // maxBackoffInterval while the endpoint keeps returning 429.
 func updateStats() time.Duration {
-	if claudeClient == nil {
-		systray.SetTitle("⚪ Error")
-		return refreshInterval
-	}
-
 	limits, err := claudeClient.GetUsageLimits()
-	if err != nil && errors.Is(err, ErrAuthFailed) && claudeClient.authMode == AuthModeOAuth {
-		// The cached in-memory token was rejected. Drop it and retry once so
-		// the provider (CurrentOAuthToken) re-reads — and, if needed,
-		// refreshes — Claude Code's credential before we tell an actually
-		// logged-in user to log in again. There is no stored refresh token of
-		// our own to fall back to; CurrentOAuthToken owns that entirely.
+	if errors.Is(err, ErrAuthFailed) {
+		// The cached token was rejected. Drop it and retry once so
+		// CurrentOAuthToken re-reads Claude Code's credential (which Claude Code
+		// may have refreshed) before we tell a logged-in user to log in again.
 		InvalidateOAuthToken()
 		limits, err = claudeClient.GetUsageLimits()
 	}
@@ -1061,28 +793,20 @@ func updateStats() time.Duration {
 		}
 		consecutiveMutex.Unlock()
 
-		action := classifyUpdate(err, count)
-		// A logged-in user being rate-limited should keep seeing their
-		// last-good numbers, not "Error loading data" — but only once there is
-		// stale data to show. A cold start with no cache yet still falls
-		// through to actionShowError, and a real auth failure (actionShowAuth)
-		// is never downgraded.
-		if action == actionShowError && errors.Is(err, ErrTransient) && haveLastLimits() {
-			action = actionKeepStale
-		}
+		action := classifyUpdate(err, count, haveLastLimits())
 
 		// The error message goes on the first item, which must be visible even
 		// if auto-hide had hidden it (e.g. the 5-hour window had no data).
 		switch action {
 		case actionShowAuth:
 			indicatorMenuItems[0].Show()
-			indicatorMenuItems[0].SetTitle("Session expired - please login again")
-			systray.SetTitle("⚪ Login")
+			indicatorMenuItems[0].SetTitle("Not logged in to Claude Code")
+			setMenuBarTitle("⚪ Login")
 		case actionKeepStale:
-			log.Printf("Transient error (%d/%d): %s", count, maxTransientErrors, redactedFetchErr(err))
+			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
 		case actionShowError:
-			log.Printf("Error fetching usage: %s", redactedFetchErr(err))
-			systray.SetTitle("⚪ Error")
+			log.Printf("Error fetching usage: %v", err)
+			setMenuBarTitle("⚪ Error")
 			indicatorMenuItems[0].Show()
 			indicatorMenuItems[0].SetTitle("Error loading data")
 		}
@@ -1101,8 +825,15 @@ func updateStats() time.Duration {
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()
 	lastLimits = limits
-	lastLimitsAt = time.Now()
 	limitsMutex.Unlock()
+
+	// The status command reads this instead of calling the API itself, which
+	// would spend the same per-account rate-limit budget as this poll.
+	if data, err := json.Marshal(limits); err == nil {
+		if err := writeFileAtomic(instanceFile(".usage.json"), data, configFilePermissions); err != nil {
+			log.Printf("Failed to write usage cache: %v", err)
+		}
+	}
 
 	// Update menu bar display
 	updateMenuBarDisplay(limits)

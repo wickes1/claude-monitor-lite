@@ -1,4 +1,4 @@
-.PHONY: help build start stop restart logout
+.PHONY: help build start stop restart
 
 # Variables
 BINARY_NAME=claude-monitor-lite
@@ -25,6 +25,3 @@ stop: ## Stop the monitor
 	@./$(BINARY_NAME) stop
 
 restart: stop start ## Restart the monitor
-
-logout: ## Logout and remove all data
-	@./$(BINARY_NAME) logout

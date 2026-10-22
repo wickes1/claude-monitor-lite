@@ -2,115 +2,81 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
-	"time"
+	"regexp"
+	"strings"
 )
 
-const (
-	configFilePermissions = 0600 // Owner read/write only
-)
+const configFilePermissions = 0600 // Owner read/write only
 
-// configWriteMutex serializes config read-modify-write cycles so concurrent
-// writers cannot lose each other's updates or interleave their file writes.
-var configWriteMutex sync.Mutex
-
+// Config is the monitor's own settings — only which metric the menu bar shows.
+// Credentials are never stored here (see credentials.go).
 type Config struct {
-	// AuthMode selects how we authenticate: "oauth" (reuse Claude Code's login,
-	// the zero-paste default) or "cookie" (legacy manual sessionKey paste).
-	//
-	// The OAuth access/refresh token itself is never stored here. It lives in
-	// Claude Code's own credential store (Keychain on macOS, .credentials.json
-	// elsewhere) and is read fresh, in memory only, at fetch time — see
-	// CurrentOAuthToken in credentials.go. Persisting a copy here would
-	// duplicate a broad-scope credential into a plaintext dotfile, a downgrade
-	// from the Keychain.
-	AuthMode string `json:"authMode,omitempty"`
-
-	// Legacy cookie auth.
-	SessionKey     string `json:"sessionKey,omitempty"`
-	OrganizationID string `json:"organizationId,omitempty"`
-
-	SavedAt          *time.Time `json:"savedAt,omitempty"`
-	MenuBarIndicator string     `json:"menuBarIndicator"`
+	MenuBarIndicator string `json:"menuBarIndicator"`
 }
 
-// configPathOverride, when non-empty, is used instead of the default
-// ~/.claude-monitor-lite.json path. Tests set this to a temp file so they
-// never read or write the real config.
-var configPathOverride string
+var unsafeInstanceChars = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+
+// instanceName is the readable name of the Claude Code environment this monitor
+// watches — the CLAUDE_CONFIG_DIR folder name, shown in the menu bar. Empty for
+// the default ~/.claude environment.
+func instanceName() string {
+	if os.Getenv("CLAUDE_CONFIG_DIR") == "" {
+		return ""
+	}
+	name := unsafeInstanceChars.ReplaceAllString(filepath.Base(absConfigDir()), "-")
+	if name = strings.Trim(name, "-"); name == "" {
+		return "custom"
+	}
+	return name
+}
+
+// instanceID makes the name unique per environment, so one monitor per
+// CLAUDE_CONFIG_DIR can run side by side without sharing a PID file, config,
+// log, or LaunchAgent — even when two dirs share a folder name.
+func instanceID() string {
+	if name := instanceName(); name != "" {
+		return name + "-" + configDirHash()
+	}
+	return ""
+}
+
+// instanceFile returns this instance's dotfile in the home directory:
+// ~/.claude-monitor-lite<ext> by default, ~/.claude-monitor-lite.<id><ext>
+// for a CLAUDE_CONFIG_DIR instance.
+func instanceFile(ext string) string {
+	homeDir, _ := os.UserHomeDir()
+	base := ".claude-monitor-lite"
+	if id := instanceID(); id != "" {
+		base += "." + id
+	}
+	return filepath.Join(homeDir, base+ext)
+}
 
 func GetConfigPath() string {
-	if configPathOverride != "" {
-		return configPathOverride
-	}
-	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".claude-monitor-lite.json")
+	return instanceFile(".json")
 }
 
+// LoadConfig reads the config, falling back to the default indicator when the
+// file is missing, unreadable, or names an unknown indicator.
 func LoadConfig() Config {
-	return loadConfigFrom(GetConfigPath())
-}
-
-// loadConfigFrom reads and validates a config file, falling back to defaults
-// if the file is missing or unreadable.
-func loadConfigFrom(path string) Config {
-	defaultConfig := Config{MenuBarIndicator: "currentSession"}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return defaultConfig
-	}
-
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return defaultConfig
+	if data, err := os.ReadFile(GetConfigPath()); err == nil {
+		_ = json.Unmarshal(data, &config)
 	}
-
-	// Fall back to the default for an unknown or stale indicator key.
-	if !isValidIndicator(config.MenuBarIndicator) {
-		config.MenuBarIndicator = "currentSession"
+	if _, ok := findIndicator(config.MenuBarIndicator); !ok {
+		config.MenuBarIndicator = indicators[0].key
 	}
-
 	return config
 }
 
-// modifyAndSaveConfig reads existing config, applies modifier function, and saves.
-func modifyAndSaveConfig(modifier func(*Config)) error {
-	return modifyAndSaveConfigAt(GetConfigPath(), modifier)
-}
-
-// modifyAndSaveConfigAt performs a serialized, atomic read-modify-write of the
-// config at path. It holds both the in-process configWriteMutex and a
-// cross-process advisory file lock (config_lock_unix.go) for the whole
-// cycle, so the daemon (a menu click) and a CLI invocation running as
-// separate OS processes can never clobber each other's update.
-func modifyAndSaveConfigAt(path string, modifier func(*Config)) error {
-	configWriteMutex.Lock()
-	defer configWriteMutex.Unlock()
-
-	release, err := acquireConfigLock(path + ".lock")
-	if err != nil {
-		return fmt.Errorf("acquire config lock: %w", err)
-	}
-	defer release()
-
-	var config Config
-	if existingData, err := os.ReadFile(path); err == nil {
-		if json.Unmarshal(existingData, &config) != nil {
-			config = Config{}
-		}
-	}
-
-	modifier(&config)
-
+func SaveConfig(config Config) error {
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, data, configFilePermissions)
+	return writeFileAtomic(GetConfigPath(), data, configFilePermissions)
 }
 
 // writeFileAtomic writes data to a temp file in the same directory and renames
@@ -136,11 +102,4 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
-}
-
-// SaveConfigPreservingSession updates only menuBarIndicator, preserving other fields.
-func SaveConfigPreservingSession(menuBarIndicator string) error {
-	return modifyAndSaveConfig(func(c *Config) {
-		c.MenuBarIndicator = menuBarIndicator
-	})
 }

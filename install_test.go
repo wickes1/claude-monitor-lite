@@ -16,10 +16,10 @@ import (
 // first element with the rest as args, so the binary must precede "start".
 func TestRenderLaunchAgent(t *testing.T) {
 	const bin = "/opt/homebrew/bin/claude-monitor-lite"
-	out := renderLaunchAgent(bin)
+	out := renderLaunchAgent(bin, "")
 
 	wantContains := []string{
-		"<string>" + launchAgentLabel + "</string>",
+		"<string>" + launchAgentLabel() + "</string>",
 		"<string>" + bin + "</string>",
 		"<string>start</string>",
 		"<key>RunAtLoad</key>",
@@ -72,7 +72,7 @@ func TestXMLEscape(t *testing.T) {
 // A home directory containing an ampersand must round-trip through
 // renderLaunchAgent as escaped XML, not raw.
 func TestRenderLaunchAgentEscapesPath(t *testing.T) {
-	out := renderLaunchAgent("/Users/a&b/bin/cml")
+	out := renderLaunchAgent("/Users/a&b/bin/cml", "")
 	if strings.Contains(out, "a&b") {
 		t.Error("renderLaunchAgent must escape & in the binary path")
 	}
@@ -90,7 +90,7 @@ func TestLaunchctlTargetsShareDomain(t *testing.T) {
 	if got := domainTarget(); got != wantDomain {
 		t.Errorf("domainTarget() = %q, want %q", got, wantDomain)
 	}
-	if got, want := serviceTarget(), domainTarget()+"/"+launchAgentLabel; got != want {
+	if got, want := serviceTarget(), domainTarget()+"/"+launchAgentLabel(); got != want {
 		t.Errorf("serviceTarget() = %q, want %q (must be domain + label)", got, want)
 	}
 }
@@ -101,7 +101,7 @@ func TestLaunchctlTargetsShareDomain(t *testing.T) {
 // autostart while the looser ordering check still passes.
 func TestRenderLaunchAgentExactArgv(t *testing.T) {
 	const bin = "/opt/homebrew/bin/claude-monitor-lite"
-	got := programArguments(t, renderLaunchAgent(bin))
+	got := programArguments(t, renderLaunchAgent(bin, ""))
 	want := []string{bin, "start"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("ProgramArguments = %v, want %v", got, want)
@@ -113,7 +113,7 @@ func TestRenderLaunchAgentExactArgv(t *testing.T) {
 // parseability property the escaping tests assume.
 func TestRenderLaunchAgentWellFormed(t *testing.T) {
 	for _, p := range []string{"/opt/homebrew/bin/claude-monitor-lite", "/Users/a&b/bin/cml", "/x<y>z/cml"} {
-		dec := xml.NewDecoder(strings.NewReader(renderLaunchAgent(p)))
+		dec := xml.NewDecoder(strings.NewReader(renderLaunchAgent(p, "")))
 		for {
 			_, err := dec.Token()
 			if err == io.EOF {
@@ -164,4 +164,31 @@ func programArguments(t *testing.T, plist string) []string {
 		}
 	}
 	return args
+}
+
+// launchd starts jobs without the installing shell's environment, so a
+// CLAUDE_CONFIG_DIR instance's plist must carry the variable itself — without
+// it autostart silently monitors the default account. Each instance also needs
+// its own label, or installing one boots out the other.
+func TestRenderLaunchAgentInstance(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	defaultLabel := launchAgentLabel()
+	if strings.Contains(renderLaunchAgent("/bin/cml", ""), "EnvironmentVariables") {
+		t.Error("default instance plist must not set EnvironmentVariables")
+	}
+
+	const dir = "/Users/x/.claude-work"
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	if launchAgentLabel() == defaultLabel {
+		t.Errorf("instance label %q must differ from the default label", launchAgentLabel())
+	}
+	out := renderLaunchAgent("/bin/cml", dir)
+	for _, w := range []string{"<key>CLAUDE_CONFIG_DIR</key>", "<string>" + dir + "</string>", "<string>" + launchAgentLabel() + "</string>"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("instance plist missing %q", w)
+		}
+	}
+	if got := programArguments(t, out); !reflect.DeepEqual(got, []string{"/bin/cml", "start"}) {
+		t.Errorf("ProgramArguments = %v, want [/bin/cml start]", got)
+	}
 }

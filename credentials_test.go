@@ -52,9 +52,8 @@ func TestCurrentOAuthToken_ExpiredCredential_ReturnsTransient(t *testing.T) {
 
 	readCredential = func() (*OAuthCredential, error) {
 		return &OAuthCredential{
-			AccessToken:  "stale-token",
-			RefreshToken: "refresh-me",
-			ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(), // already expired
+			AccessToken: "stale-token",
+			ExpiresAt:   time.Now().Add(-time.Hour).UnixMilli(), // already expired
 		}, nil
 	}
 
@@ -159,54 +158,25 @@ func TestInvalidateOAuthToken_NoCachedCredential_NoPanic(t *testing.T) {
 	}
 }
 
-// --- Credential resolution order ---
-
-// The credentials file is authoritative when present: the Keychain must not
-// even be consulted, so a stale Keychain item can never shadow a fresh
-// on-disk credential.
-func TestReadClaudeCodeCredential_FileWins_KeychainNeverCalled(t *testing.T) {
-	origFileReader := fileReader
-	origKeychainReader := keychainReader
-	t.Cleanup(func() {
-		fileReader = origFileReader
-		keychainReader = origKeychainReader
-	})
-
-	fileReader = func(string) (*OAuthCredential, error) {
-		return &OAuthCredential{AccessToken: "from-file"}, nil
-	}
-	keychainReader = func(string) (*OAuthCredential, error) {
-		t.Error("keychain reader must not be called when the credentials file resolves")
-		return nil, errors.New("should not be reached")
+// A CLAUDE_CONFIG_DIR environment must read its own Keychain item. Reading the
+// plain item instead silently reports the default account's usage under the
+// other environment's label. The hash follows Claude Code's own naming,
+// checked against an item it created in a real Keychain.
+func TestKeychainService(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	if got := keychainService(); got != keychainServiceBase {
+		t.Errorf("default env: got %q, want plain %q", got, keychainServiceBase)
 	}
 
-	cred, err := ReadClaudeCodeCredential()
-	if err != nil {
-		t.Fatalf("expected success, got: %v", err)
-	}
-	if cred.AccessToken != "from-file" {
-		t.Errorf("AccessToken = %q, want %q", cred.AccessToken, "from-file")
-	}
-}
-
-// When neither source resolves, the caller gets an error naming the config
-// directory — never a panic, and never a partially-populated credential.
-func TestReadClaudeCodeCredential_BothFail_ReturnsError(t *testing.T) {
-	origFileReader := fileReader
-	origKeychainReader := keychainReader
-	t.Cleanup(func() {
-		fileReader = origFileReader
-		keychainReader = origKeychainReader
-	})
-
-	fileReader = func(string) (*OAuthCredential, error) {
-		return nil, errors.New("no credentials file")
-	}
-	keychainReader = func(string) (*OAuthCredential, error) {
-		return nil, errors.New("no keychain item")
-	}
-
-	if _, err := ReadClaudeCodeCredential(); err == nil {
-		t.Fatal("expected an error when neither source resolves")
+	const want = "Claude Code-credentials-be865d75"
+	for _, dir := range []string{
+		"/Users/alice/.claude-work",
+		"/Users/alice/.claude-work/",
+		"/Users/alice/x/../.claude-work",
+	} {
+		t.Setenv("CLAUDE_CONFIG_DIR", dir)
+		if got := keychainService(); got != want {
+			t.Errorf("CLAUDE_CONFIG_DIR=%q: got %q, want %q", dir, got, want)
+		}
 	}
 }

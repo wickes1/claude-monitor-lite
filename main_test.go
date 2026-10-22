@@ -5,39 +5,47 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// classifyUpdate encodes what the menu bar may show after a failed fetch. The
+// key case: with cached data, a transient failure that persists (an expired
+// token over a weekend, an outage) must eventually show "Error" — otherwise the
+// menu bar presents frozen numbers as current. Only a 429 keeps stale data
+// indefinitely, because its backoff recovers on its own.
 func TestClassifyUpdate(t *testing.T) {
 	authErr := fmt.Errorf("%w: detail", ErrAuthFailed)
 	transientErr := fmt.Errorf("%w: detail", ErrTransient)
+	rateLimitErr := &RateLimitError{}
 	unknownErr := errors.New("something unexpected")
+	past := maxTransientErrors + 1
 
 	cases := []struct {
-		name  string
-		err   error
-		count int
-		want  updateAction
+		name      string
+		err       error
+		count     int
+		haveCache bool
+		want      updateAction
 	}{
-		{"auth failure shows login immediately", authErr, 1, actionShowAuth},
-		{"auth failure outranks transient count", authErr, 99, actionShowAuth},
-		{"first transient keeps stale data", transientErr, 1, actionKeepStale},
-		{"transient at tolerance boundary keeps stale", transientErr, maxTransientErrors, actionKeepStale},
-		{"transient past tolerance shows error", transientErr, maxTransientErrors + 1, actionShowError},
-		{"unknown error shows error immediately", unknownErr, 1, actionShowError},
+		{"auth failure shows login immediately", authErr, 1, true, actionShowAuth},
+		{"auth failure outranks transient count", authErr, 99, true, actionShowAuth},
+		{"first transient keeps stale data", transientErr, 1, true, actionKeepStale},
+		{"transient at tolerance boundary keeps stale", transientErr, maxTransientErrors, true, actionKeepStale},
+		{"persistent transient shows error despite cache", transientErr, past, true, actionShowError},
+		{"persistent 429 with cache keeps stale", rateLimitErr, 99, true, actionKeepStale},
+		{"persistent 429 on cold start shows error", rateLimitErr, past, false, actionShowError},
+		{"unknown error shows error immediately", unknownErr, 1, true, actionShowError},
 	}
 
 	for _, tc := range cases {
-		if got := classifyUpdate(tc.err, tc.count); got != tc.want {
-			t.Errorf("%s: classifyUpdate(%v, %d) = %v, want %v",
-				tc.name, tc.err, tc.count, got, tc.want)
+		if got := classifyUpdate(tc.err, tc.count, tc.haveCache); got != tc.want {
+			t.Errorf("%s: classifyUpdate(%v, %d, %v) = %v, want %v",
+				tc.name, tc.err, tc.count, tc.haveCache, got, tc.want)
 		}
 	}
 }
@@ -96,33 +104,6 @@ func TestWithJitter(t *testing.T) {
 	}
 }
 
-// haveLastLimits must report whether a cached usage response exists, so a
-// rate-limited poll knows whether it can serve stale data instead of
-// falling through to the error state.
-func TestHaveLastLimits(t *testing.T) {
-	limitsMutex.Lock()
-	old := lastLimits
-	lastLimits = nil
-	limitsMutex.Unlock()
-	defer func() {
-		limitsMutex.Lock()
-		lastLimits = old
-		limitsMutex.Unlock()
-	}()
-
-	if haveLastLimits() {
-		t.Error("haveLastLimits() = true with nil cache, want false")
-	}
-
-	limitsMutex.Lock()
-	lastLimits = &UsageLimits{}
-	limitsMutex.Unlock()
-
-	if !haveLastLimits() {
-		t.Error("haveLastLimits() = false with cached limits, want true")
-	}
-}
-
 func TestIsOurProcess(t *testing.T) {
 	// The running test binary is "claude-monitor-lite.test" — our process.
 	if !isOurProcess(os.Getpid()) {
@@ -157,56 +138,6 @@ func TestCreatePIDFileExclusive(t *testing.T) {
 	}
 }
 
-// A transient blip during login validation must not reject a valid key.
-func TestValidateSessionRetriesTransient(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) <= 2 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		if strings.HasSuffix(r.URL.Path, "/organizations") {
-			_, _ = w.Write([]byte(`[{"uuid":"org-1"}]`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
-	}))
-	defer srv.Close()
-
-	if err := validateSession(newTestClient(srv.URL, ""), 3, 0); err != nil {
-		t.Fatalf("validateSession should succeed after transient blips, got: %v", err)
-	}
-}
-
-// A real auth failure must be reported immediately, without retrying.
-func TestValidateSessionExpiredNoRetry(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	err := validateSession(newTestClient(srv.URL, ""), 3, 0)
-	if !errors.Is(err, ErrSessionExpired) {
-		t.Fatalf("expected ErrSessionExpired, got: %v", err)
-	}
-	if n := calls.Load(); n != 1 {
-		t.Errorf("made %d HTTP calls, want 1 (must not retry a real auth failure)", n)
-	}
-}
-
-func TestValidateSessionGivesUpAfterAttempts(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	if err := validateSession(newTestClient(srv.URL, ""), 3, 0); err == nil {
-		t.Fatal("expected an error after exhausting retries, got nil")
-	}
-}
-
 // The indicators table is the single source of truth for menu items, config
 // validation and selection — every key must be unique and non-empty, with a
 // getter, or those layers silently break.
@@ -223,53 +154,42 @@ func TestIndicatorsTableConsistent(t *testing.T) {
 			t.Errorf("duplicate indicator key %q", ind.key)
 		}
 		seen[ind.key] = true
-		if !isValidIndicator(ind.key) {
-			t.Errorf("isValidIndicator(%q) = false for a table entry", ind.key)
+		if _, ok := findIndicator(ind.key); !ok {
+			t.Errorf("findIndicator(%q) not found for a table entry", ind.key)
 		}
 	}
-	if isValidIndicator("bogusKey") {
-		t.Error("isValidIndicator accepted an unknown key")
+	if _, ok := findIndicator("bogusKey"); ok {
+		t.Error("findIndicator accepted an unknown key")
 	}
 }
 
-// getSelectedLimit must route each key to the matching window and fall back to
-// the 5-hour window for an unknown key.
-func TestGetSelectedLimitRouting(t *testing.T) {
+// Each key must route to its own window, and an unknown key (e.g. a metric
+// that was removed) must fall back to the 5-hour window.
+func TestFindIndicatorRouting(t *testing.T) {
+	extra := 3.0
 	limits := &UsageLimits{
-		FiveHour:         &UsageLimit{Utilization: 1},
-		SevenDay:         &UsageLimit{Utilization: 2},
-		SevenDayOpus:     &UsageLimit{Utilization: 4},
-		SevenDaySonnet:   &UsageLimit{Utilization: 5},
-		SevenDayOmelette: &UsageLimit{Utilization: 7},
+		FiveHour:   &UsageLimit{Utilization: 1},
+		SevenDay:   &UsageLimit{Utilization: 2},
+		ExtraUsage: &ExtraUsageInfo{Utilization: &extra},
 	}
 	cases := map[string]float64{
 		"currentSession": 1,
 		"weeklyAll":      2,
-		"weeklyOpus":     4,
-		"weeklySonnet":   5,
-		"weeklyDesign":   7,
-		"bogusKey":       1, // unknown -> default five_hour
+		"extraUsage":     3,
+		"bogusKey":       1,
 	}
 	for key, want := range cases {
-		got := getSelectedLimit(limits, key)
-		if got == nil || got.Utilization != want {
-			t.Errorf("getSelectedLimit(%q) = %+v, want utilization %v", key, got, want)
+		ind, _ := findIndicator(key)
+		if got := ind.get(limits); got == nil || got.Utilization != want {
+			t.Errorf("findIndicator(%q).get = %+v, want utilization %v", key, got, want)
 		}
 	}
 }
 
 // The scoped-limit display path must label a model-scoped weekly entry with
-// its display name and show its percent, for the live fixture's Fable window.
+// its display name and show its percent, for the live shape's Fable window.
 func TestFormatScopedLimitLine_ModelScoped(t *testing.T) {
-	body := liveFixtureBody(t)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
-	}))
-	defer srv.Close()
-
-	limits, err := newTestClient(srv.URL, "test-org").GetUsageLimits()
+	limits, err := serveBody(t, http.StatusOK, liveShapeBody).GetUsageLimits()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
@@ -298,92 +218,42 @@ func TestExtraUsageWindow(t *testing.T) {
 	if extraUsageWindow(&UsageLimits{}) != nil {
 		t.Error("extraUsageWindow(no extra_usage) should be nil")
 	}
-	if extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{IsEnabled: false}}) != nil {
-		t.Error("extraUsageWindow(disabled, nil utilization) should be nil")
+	if extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{}}) != nil {
+		t.Error("extraUsageWindow(nil utilization) should be nil")
 	}
 	util := 25.0
-	w := extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{IsEnabled: true, Utilization: &util}})
+	w := extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{Utilization: &util}})
 	if w == nil || w.Utilization != 25.0 {
 		t.Errorf("extraUsageWindow(enabled 25%%) = %+v, want utilization 25", w)
 	}
 }
 
-// migrateStripLegacySecrets must rewrite an old plaintext config that still
-// carries a Claude Code access/refresh token, dropping the secret fields
-// while preserving unrelated settings.
-func TestMigrateStripLegacySecrets_RemovesLegacyTokenFields(t *testing.T) {
-	path := withTempConfigPath(t)
-
-	legacyJSON := `{
-		"authMode": "oauth",
-		"accessToken": "sk-ant-oat01-legacy-secret",
-		"refreshToken": "sk-ant-ort01-legacy-secret",
-		"expiresAt": 1234567890000,
-		"menuBarIndicator": "weeklyAll"
-	}`
-	if err := os.WriteFile(path, []byte(legacyJSON), 0600); err != nil {
-		t.Fatalf("failed to seed legacy config: %v", err)
-	}
-
-	migrateStripLegacySecrets()
-
-	raw, err := os.ReadFile(path)
+// The status command shows what the daemon last fetched, read back from the
+// usage cache; the round trip must keep everything the display uses.
+func TestUsageCacheRoundTrip(t *testing.T) {
+	limits, err := serveBody(t, http.StatusOK, liveShapeBody).GetUsageLimits()
 	if err != nil {
-		t.Fatalf("failed to read migrated config: %v", err)
+		t.Fatal(err)
 	}
-	got := string(raw)
-
-	for _, secret := range []string{"accessToken", "refreshToken", "expiresAt"} {
-		if strings.Contains(got, secret) {
-			t.Errorf("migrated config still contains %q:\n%s", secret, got)
+	data, err := json.Marshal(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *UsageLimits
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	render := func(u *UsageLimits) string {
+		var b strings.Builder
+		for _, ind := range indicators {
+			b.WriteString(formatConsoleUsage(ind.get(u), ind.label, ""))
 		}
+		for _, entry := range u.Limits {
+			b.WriteString(formatScopedLimitLine(entry))
+		}
+		return b.String()
 	}
-
-	var c Config
-	if err := json.Unmarshal(raw, &c); err != nil {
-		t.Fatalf("migrated config is not valid JSON: %v", err)
-	}
-	if c.AuthMode != "oauth" {
-		t.Errorf("AuthMode = %q, want preserved %q", c.AuthMode, "oauth")
-	}
-	if c.MenuBarIndicator != "weeklyAll" {
-		t.Errorf("MenuBarIndicator = %q, want preserved %q", c.MenuBarIndicator, "weeklyAll")
-	}
-}
-
-// A config file that is already clean (no legacy secret fields) must not be
-// rewritten at all.
-func TestMigrateStripLegacySecrets_NoopOnCleanConfig(t *testing.T) {
-	path := withTempConfigPath(t)
-
-	cleanJSON := `{"authMode":"oauth","menuBarIndicator":"weeklyAll"}`
-	if err := os.WriteFile(path, []byte(cleanJSON), 0600); err != nil {
-		t.Fatalf("failed to seed config: %v", err)
-	}
-	before, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	migrateStripLegacySecrets()
-
-	after, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !after.ModTime().Equal(before.ModTime()) {
-		t.Error("migrateStripLegacySecrets rewrote an already-clean config file")
-	}
-}
-
-// A missing config file (fresh install, never run before) must be a silent
-// no-op — no panic, no file created.
-func TestMigrateStripLegacySecrets_NoopOnMissingFile(t *testing.T) {
-	path := withTempConfigPath(t) // points at a path that does not exist yet
-
-	migrateStripLegacySecrets()
-
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("expected no config file to be created, stat err = %v", err)
+	if got, want := render(got), render(limits); got != want {
+		t.Errorf("round trip changed the displayed usage:\n got %s\nwant %s", got, want)
 	}
 }

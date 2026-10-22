@@ -19,9 +19,18 @@ import (
 	"strings"
 )
 
-// launchAgentLabel is the reverse-DNS LaunchAgent label, aligned to the Go
+// launchAgentBaseLabel is the reverse-DNS LaunchAgent label, aligned to the Go
 // module path so it is OSS-neutral and stable across machines.
-const launchAgentLabel = "io.github.wickes1.claude-monitor-lite"
+const launchAgentBaseLabel = "io.github.wickes1.claude-monitor-lite"
+
+// launchAgentLabel gives each CLAUDE_CONFIG_DIR instance its own launchd job,
+// so installing one instance's autostart never boots out another's.
+func launchAgentLabel() string {
+	if id := instanceID(); id != "" {
+		return launchAgentBaseLabel + "." + id
+	}
+	return launchAgentBaseLabel
+}
 
 // launchAgentPath returns ~/Library/LaunchAgents/<label>.plist.
 func launchAgentPath() (string, error) {
@@ -29,7 +38,7 @@ func launchAgentPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(homeDir, "Library", "LaunchAgents", launchAgentLabel+".plist"), nil
+	return filepath.Join(homeDir, "Library", "LaunchAgents", launchAgentLabel()+".plist"), nil
 }
 
 // resolveBinaryPath returns the absolute path to embed in the LaunchAgent.
@@ -78,9 +87,20 @@ func xmlEscape(s string) string {
 // leak (setsid/AbandonProcessGroup do NOT exempt it — launchd tears down the
 // whole job tree). No KeepAlive: launchd must not respawn the monitor after the
 // user quits it from the menu bar. No StandardOutPath/StandardErrorPath: the
-// daemon rebinds its own log to ~/.claude-monitor-lite.log (setupDaemonLogging),
+// daemon rebinds its own log to ~/.claude-monitor-lite*.log (setupDaemonLogging),
 // so a launchd-level redirect would only capture the millisecond-long launcher.
-func renderLaunchAgent(binaryPath string) string {
+// A non-empty configDir is passed through as CLAUDE_CONFIG_DIR, because launchd
+// starts the job without the installing shell's environment.
+func renderLaunchAgent(binaryPath, configDir string) string {
+	env := ""
+	if configDir != "" {
+		env = fmt.Sprintf(`	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CLAUDE_CONFIG_DIR</key>
+		<string>%s</string>
+	</dict>
+`, xmlEscape(configDir))
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -94,14 +114,14 @@ func renderLaunchAgent(binaryPath string) string {
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
-</dict>
+%s</dict>
 </plist>
-`, xmlEscape(launchAgentLabel), xmlEscape(binaryPath))
+`, xmlEscape(launchAgentLabel()), xmlEscape(binaryPath), env)
 }
 
 // serviceTarget returns the launchctl service target gui/<uid>/<label>.
 func serviceTarget() string {
-	return fmt.Sprintf("gui/%s/%s", strconv.Itoa(os.Getuid()), launchAgentLabel)
+	return fmt.Sprintf("gui/%s/%s", strconv.Itoa(os.Getuid()), launchAgentLabel())
 }
 
 // domainTarget returns the launchctl domain target gui/<uid>.
@@ -139,7 +159,16 @@ func handleInstall() {
 		os.Exit(1)
 	}
 
-	plist := renderLaunchAgent(binPath)
+	// launchd runs the job from /, so a relative CLAUDE_CONFIG_DIR would point
+	// at the wrong directory there.
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if configDir != "" {
+		if configDir, err = filepath.Abs(configDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to resolve CLAUDE_CONFIG_DIR: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	plist := renderLaunchAgent(binPath, configDir)
 
 	if err := writeFileAtomic(plistPath, []byte(plist), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write LaunchAgent: %v\n", err)
