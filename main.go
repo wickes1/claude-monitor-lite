@@ -427,24 +427,35 @@ func handleStart() {
 }
 
 func handleStop() {
+	pid, err := stopRunning()
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "Failed to stop process: %v\n", err)
+		os.Exit(1)
+	case pid == 0:
+		fmt.Println("Claude Monitor Lite is not running.")
+	default:
+		fmt.Printf("Claude Monitor Lite (PID: %d) stopped.\n", pid)
+	}
+}
+
+// stopRunning stops this instance's monitor and returns its PID, or 0 when
+// none was running.
+func stopRunning() (int, error) {
 	pid, ok := readValidPID()
 	if !ok {
-		fmt.Println("Claude Monitor Lite is not running.")
-		os.Exit(0)
+		return 0, nil
 	}
-
 	// readValidPID already confirmed this PID is our process.
 	process, _ := os.FindProcess(pid) // never errors on Unix
 	if err := process.Signal(syscall.SIGTERM); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to stop process: %v\n", err)
-		os.Exit(1)
+		return pid, err
 	}
-
-	fmt.Printf("Claude Monitor Lite (PID: %d) stopped.\n", pid)
 	time.Sleep(pidCheckTimeout)
 	if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to remove PID file: %v\n", err)
 	}
+	return pid, nil
 }
 
 // isOurProcess reports whether pid belongs to a live claude-monitor-lite

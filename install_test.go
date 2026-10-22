@@ -51,6 +51,13 @@ func TestRenderLaunchAgent(t *testing.T) {
 	if strings.Contains(out, "KeepAlive") {
 		t.Error("plist must NOT contain KeepAlive")
 	}
+
+	// start exits right after forking the daemon; without AbandonProcessGroup
+	// launchd kills the daemon along with the finished launcher, so autostart
+	// would leave no monitor running.
+	if !strings.Contains(out, "<key>AbandonProcessGroup</key>\n\t<true/>") {
+		t.Error("plist must set AbandonProcessGroup to true")
+	}
 }
 
 // A path with XML metacharacters (possible in a home directory name) must not

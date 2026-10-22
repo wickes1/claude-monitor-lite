@@ -105,7 +105,7 @@ This writes `~/Library/LaunchAgents/io.github.wickes1.claude-monitor-lite.plist`
 claude-monitor-lite uninstall
 ```
 
-A LaunchAgent owns the monitor's lifecycle: `uninstall` disables autostart and stops a monitor that autostart had started, and a reinstall restarts it. Start it again anytime with `claude-monitor-lite`.
+`uninstall` disables autostart and stops the running monitor; a reinstall restarts it (run it after `brew upgrade` to switch to the new version). Start it again anytime with `claude-monitor-lite`.
 
 ## Troubleshooting
 

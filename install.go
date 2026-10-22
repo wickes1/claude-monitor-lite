@@ -81,12 +81,12 @@ func xmlEscape(s string) string {
 // is unit-testable.
 //
 // RunAtLoad makes launchd run `<binary> start` at login, which forks the
-// systray daemon. The daemon stays part of this launchd job, so unloading the
-// agent (launchctl bootout — done by uninstall and by install's idempotent
-// reload) stops the daemon too: that is standard LaunchAgent lifecycle, not a
-// leak (setsid/AbandonProcessGroup do NOT exempt it — launchd tears down the
-// whole job tree). No KeepAlive: launchd must not respawn the monitor after the
-// user quits it from the menu bar. No StandardOutPath/StandardErrorPath: the
+// systray daemon and exits. AbandonProcessGroup keeps launchd from killing
+// that daemon as soon as the launcher exits (observed on macOS 26: without
+// it, `install` from a shell left no monitor running). It also means unloading
+// the agent no longer reliably stops the daemon, so install and uninstall
+// stop it by PID themselves. No KeepAlive: launchd must not respawn the
+// monitor after the user quits it from the menu bar. No StandardOutPath/StandardErrorPath: the
 // daemon rebinds its own log to ~/.claude-monitor-lite*.log (setupDaemonLogging),
 // so a launchd-level redirect would only capture the millisecond-long launcher.
 // A non-empty configDir is passed through as CLAUDE_CONFIG_DIR, because launchd
@@ -113,6 +113,8 @@ func renderLaunchAgent(binaryPath, configDir string) string {
 		<string>start</string>
 	</array>
 	<key>RunAtLoad</key>
+	<true/>
+	<key>AbandonProcessGroup</key>
 	<true/>
 %s</dict>
 </plist>
@@ -176,10 +178,15 @@ func handleInstall() {
 	}
 
 	// Boot out any previously-registered job so bootstrap cannot fail with
-	// "service already loaded" (makes install idempotent). If autostart was
-	// already running the monitor this stops it, and the bootstrap below
-	// restarts it via RunAtLoad — a reinstall is a restart.
+	// "service already loaded" (makes install idempotent), and stop a running
+	// monitor so the bootstrap below restarts it via RunAtLoad on the binary
+	// just installed — a reinstall is a restart.
 	_ = exec.Command("launchctl", "bootout", serviceTarget()).Run()
+	restarted, err := stopRunning()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to stop the running monitor: %v\n", err)
+		os.Exit(1)
+	}
 
 	if out, err := exec.Command("launchctl", "bootstrap", domainTarget(), plistPath).CombinedOutput(); err != nil {
 		// Roll the plist back so a failed install leaves nothing that launchd
@@ -191,6 +198,9 @@ func handleInstall() {
 	}
 
 	fmt.Println("✓ Installed. claude-monitor-lite will start automatically at login.")
+	if restarted != 0 {
+		fmt.Printf("  Restarted the running monitor (was PID %d).\n", restarted)
+	}
 	fmt.Printf("  LaunchAgent: %s\n", plistPath)
 	fmt.Printf("  Binary:      %s\n", binPath)
 	fmt.Println("  Remove with: claude-monitor-lite uninstall")
@@ -234,6 +244,12 @@ func handleUninstall() {
 		os.Exit(1)
 	}
 
-	fmt.Println("  If autostart was running the monitor, launchctl has now stopped it.")
+	switch pid, err := stopRunning(); {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "Failed to stop the running monitor: %v\n", err)
+		os.Exit(1)
+	case pid != 0:
+		fmt.Printf("  Stopped the running monitor (PID %d).\n", pid)
+	}
 	fmt.Println("  Start it again anytime with: claude-monitor-lite")
 }
