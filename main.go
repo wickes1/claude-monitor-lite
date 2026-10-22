@@ -311,6 +311,8 @@ func main() {
 			handleInstall()
 		case "uninstall":
 			handleUninstall()
+		case "statusline":
+			handleStatusLine(os.Args[2:])
 		case "version", "--version", "-v":
 			fmt.Printf("claude-monitor-lite %s\n", version)
 			os.Exit(0)
@@ -338,6 +340,8 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
 	fmt.Println("  claude-monitor-lite install      Start automatically at login (LaunchAgent)")
 	fmt.Println("  claude-monitor-lite uninstall    Stop starting automatically at login")
+	fmt.Println("  claude-monitor-lite statusline install    Live usage from Claude Code's status line")
+	fmt.Println("  claude-monitor-lite statusline uninstall  Restore your original status line")
 	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
 	fmt.Println()
@@ -493,12 +497,17 @@ func createPIDFile() error {
 	return err
 }
 
+// openLogFile opens this instance's log for appending.
+func openLogFile() (*os.File, error) {
+	return os.OpenFile(instanceFile(".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
+}
+
 // setupDaemonLogging routes the daemon's log output to a file. The daemon runs
 // detached with no terminal attached, so otherwise every log line (transient
 // errors, fetch failures) is discarded and the process cannot be diagnosed
 // after the fact. Logs go to this instance's ~/.claude-monitor-lite*.log.
 func setupDaemonLogging() {
-	f, err := os.OpenFile(instanceFile(".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
+	f, err := openLogFile()
 	if err != nil {
 		return
 	}
@@ -731,22 +740,33 @@ func requestRefresh() {
 	}
 }
 
+// lastUpdateAt is when the displayed usage was last current — a successful
+// poll, or the change time of an applied status line update. Starting at
+// process start keeps a status line file left over from before the daemon
+// ran from being shown as current. Touched only by the update worker.
+var lastUpdateAt = time.Now()
+
 // runUpdateWorker is the single goroutine that fetches usage data — on a timer
 // and on demand. Confining fetches to one goroutine means updateStats never
 // runs concurrently with itself. The timer is rescheduled after every fetch
 // using the delay updateStats returns — the base interval normally, backed
 // off further while the endpoint is rate-limiting us — with jitter applied so
 // this monitor does not beat in lockstep with others polling the same
-// endpoint.
+// endpoint. Between polls it also applies status line updates, which cost no
+// request (statusline.go).
 func runUpdateWorker(ctx context.Context) {
 	delay := updateStats() // initial fetch
 	timer := time.NewTimer(withJitter(delay))
 	defer timer.Stop()
+	statusLineTicker := time.NewTicker(statusLineCheckInterval)
+	defer statusLineTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-statusLineTicker.C:
+			applyStatusLineUpdate()
 		case <-timer.C:
 			delay = updateStats()
 			timer.Reset(withJitter(delay))
@@ -768,6 +788,9 @@ func runUpdateWorker(ctx context.Context) {
 // success or on a non-rate-limit error, or a value backed off toward
 // maxBackoffInterval while the endpoint keeps returning 429.
 func updateStats() time.Duration {
+	// Stamped before the request, so a status line update written while it is
+	// in flight still counts as newer than this poll.
+	polledAt := time.Now()
 	limits, err := claudeClient.GetUsageLimits()
 	if errors.Is(err, ErrAuthFailed) {
 		// The cached token was rejected. Drop it and retry once so
@@ -819,6 +842,33 @@ func updateStats() time.Duration {
 	consecutiveRateLimits = 0
 	consecutiveMutex.Unlock()
 
+	lastUpdateAt = polledAt
+	showLimits(limits)
+	return refreshInterval
+}
+
+// applyStatusLineUpdate shows usage from a status line render newer than the
+// displayed data, layered over the last poll.
+func applyStatusLineUpdate() {
+	live, changedAt, err := readStatusLineUpdate(lastUpdateAt)
+	if err != nil {
+		log.Printf("Failed to read status line usage: %v", err)
+		return
+	}
+	if live == nil {
+		return
+	}
+	lastUpdateAt = changedAt
+
+	limitsMutex.RLock()
+	base := lastLimits
+	limitsMutex.RUnlock()
+	showLimits(mergeStatusLine(base, live))
+}
+
+// showLimits makes limits the displayed usage: menu items, menu bar, and the
+// cache the status command reads.
+func showLimits(limits *UsageLimits) {
 	// Refresh every indicator's title and hide the ones with no data.
 	applyIndicatorMenu(limits)
 
@@ -837,8 +887,6 @@ func updateStats() time.Duration {
 
 	// Update menu bar display
 	updateMenuBarDisplay(limits)
-
-	return refreshInterval
 }
 
 func onExit() {

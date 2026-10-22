@@ -9,6 +9,7 @@ A lightweight menu bar monitor that displays **real-time rate limits** from your
 - 5-hour session, weekly (all models), and pay-as-you-go extra usage in the menu bar; per-model weekly windows (e.g. Fable) in the terminal status
 - Traffic light indicator: 🟢 Green (0-49%), 🟡 Yellow (50-79%), 🔴 Red (80%+)
 - Refreshes every 3 minutes, backing off further when the usage endpoint rate-limits; keeps the last numbers while rate-limited, but shows "Error" if fetching keeps failing for any other reason
+- Optional live mode: updates within seconds while you use Claude Code, fed by its status line (see [Live updates](#live-updates))
 - Watches several Claude Code environments side by side (e.g. personal and work)
 
 **Platform:** macOS. A Linux build is published but untested; `install` is macOS-only.
@@ -59,6 +60,8 @@ claude-monitor-lite              # Start or show status
 claude-monitor-lite stop         # Stop the monitor
 claude-monitor-lite install      # Start automatically at login
 claude-monitor-lite uninstall    # Stop starting at login
+claude-monitor-lite statusline install    # Live updates from Claude Code's status line
+claude-monitor-lite statusline uninstall  # Restore your original status line
 claude-monitor-lite version      # Show version
 ```
 
@@ -70,9 +73,23 @@ The monitor reads whichever Claude Code environment it is started in: `~/.claude
 CLAUDE_CONFIG_DIR=~/.claude-work claude-monitor-lite
 ```
 
-Each environment runs as its own instance, so two accounts can be watched side by side: start one plainly and one with `CLAUDE_CONFIG_DIR` set. A `CLAUDE_CONFIG_DIR` instance is named after the directory (`~/.claude-work` → `claude-work`), and its menu bar title carries that prefix. Its files are `~/.claude-monitor-lite.<name>-<hash>.{json,pid,log,usage.json}`, where `<hash>` is the same directory hash Claude Code uses, so two directories with the same folder name never collide. Run `install` / `stop` / `uninstall` with the same `CLAUDE_CONFIG_DIR` to act on that instance; its LaunchAgent records the variable so autostart watches the same account.
+Each environment runs as its own instance, so two accounts can be watched side by side: start one plainly and one with `CLAUDE_CONFIG_DIR` set. A `CLAUDE_CONFIG_DIR` instance is named after the directory (`~/.claude-work` → `claude-work`), and its menu bar title carries that prefix. Its files are `~/.claude-monitor-lite.<name>-<hash>.{json,pid,log,usage.json,statusline-usage.json,statusline-wrap}`, where `<hash>` is the same directory hash Claude Code uses, so two directories with the same folder name never collide. Run `install` / `stop` / `uninstall` with the same `CLAUDE_CONFIG_DIR` to act on that instance; its LaunchAgent records the variable so autostart watches the same account.
 
 It is read-only toward the credential store: it never writes a Keychain item or credentials file and never refreshes a token — the login is owned by Claude Code. On macOS the credential is the `Claude Code-credentials` Keychain item, or `Claude Code-credentials-<sha256(dir)[:8]>` when `CLAUDE_CONFIG_DIR` is set (Claude Code's own naming); on Linux it is `<dir>/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)).
+
+## Live updates
+
+The usage endpoint only allows about one request every 2–3 minutes for tools other than Claude Code, so polling cannot go faster. Claude Code, however, already passes the 5-hour and weekly usage to its [status line](https://code.claude.com/docs/en/statusline) command after every response. Opt in to use that:
+
+```bash
+claude-monitor-lite statusline install
+```
+
+This points `statusLine.command` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) at `claude-monitor-lite statusline`, which saves the usage for the monitor and then runs your original status line command unchanged, so your status line looks the same. With no status line configured before, it stays blank. The original `settings.json` is backed up to `settings.json.claude-monitor-lite.bak`.
+
+While Claude Code is in use the menu bar then follows within seconds, at no extra API cost. Polling continues every 3 minutes for everything the status line does not carry: usage from claude.ai or the desktop app, extra usage, and per-model weekly limits. Needs a Claude.ai subscription and a Claude Code version whose status line input includes `rate_limits`; otherwise the monitor simply keeps polling.
+
+`claude-monitor-lite statusline uninstall` restores your original command. Run it before removing the binary (e.g. `brew uninstall`), or Claude Code's status line goes blank. Install again after moving the binary (e.g. switching from a source build to Homebrew) so the status line points at the new path.
 
 ## Start at login
 
