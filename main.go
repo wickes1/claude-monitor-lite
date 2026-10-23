@@ -543,6 +543,7 @@ func onReady() {
 	// Create context for graceful shutdown
 	appCtx, appCancel = context.WithCancel(context.Background())
 
+	setStatusItemName()
 	setMenuBarTitle("⚪ Loading...")
 	systray.SetTooltip(strings.TrimSpace("Claude Monitor Lite " + instanceName()))
 
