@@ -53,7 +53,8 @@ homebrew_casks:
     license: MIT
     hooks:
       post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/claude-monitor-lite"]
+        # Steps form (GoReleaser >= 2.19): Homebrew deprecated the Ruby `postflight do` block that `install` writes.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/claude-monitor-lite"]
           end
