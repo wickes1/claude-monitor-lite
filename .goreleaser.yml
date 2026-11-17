@@ -47,6 +47,10 @@ homebrew_casks:
   - repository:
       owner: wickes1
       name: homebrew-tap
+      # Pushed over SSH with a deploy key that can write to the tap and nothing else; a personal token expires.
+      git:
+        url: git@github.com:wickes1/homebrew-tap.git
+        private_key: "{{ .Env.TAP_DEPLOY_KEY }}"
     directory: Casks
     homepage: https://github.com/wickes1/claude-monitor-lite
     description: "Lightweight menu bar monitor for Claude usage"
