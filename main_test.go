@@ -1,14 +1,11 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -135,125 +132,5 @@ func TestCreatePIDFileExclusive(t *testing.T) {
 	}
 	if err := createPIDFile(); err == nil {
 		t.Error("second createPIDFile succeeded, want error (O_EXCL must refuse an existing file)")
-	}
-}
-
-// The indicators table is the single source of truth for menu items, config
-// validation and selection — every key must be unique and non-empty, with a
-// getter, or those layers silently break.
-func TestIndicatorsTableConsistent(t *testing.T) {
-	if len(indicators) == 0 {
-		t.Fatal("indicators table is empty")
-	}
-	seen := make(map[string]bool)
-	for _, ind := range indicators {
-		if ind.key == "" || ind.label == "" || ind.get == nil {
-			t.Errorf("indicator %q has an empty field: %+v", ind.key, ind)
-		}
-		if seen[ind.key] {
-			t.Errorf("duplicate indicator key %q", ind.key)
-		}
-		seen[ind.key] = true
-		if _, ok := findIndicator(ind.key); !ok {
-			t.Errorf("findIndicator(%q) not found for a table entry", ind.key)
-		}
-	}
-	if _, ok := findIndicator("bogusKey"); ok {
-		t.Error("findIndicator accepted an unknown key")
-	}
-}
-
-// Each key must route to its own window, and an unknown key (e.g. a metric
-// that was removed) must fall back to the 5-hour window.
-func TestFindIndicatorRouting(t *testing.T) {
-	extra := 3.0
-	limits := &UsageLimits{
-		FiveHour:   &UsageLimit{Utilization: 1},
-		SevenDay:   &UsageLimit{Utilization: 2},
-		ExtraUsage: &ExtraUsageInfo{Utilization: &extra},
-	}
-	cases := map[string]float64{
-		"currentSession": 1,
-		"weeklyAll":      2,
-		"extraUsage":     3,
-		"bogusKey":       1,
-	}
-	for key, want := range cases {
-		ind, _ := findIndicator(key)
-		if got := ind.get(limits); got == nil || got.Utilization != want {
-			t.Errorf("findIndicator(%q).get = %+v, want utilization %v", key, got, want)
-		}
-	}
-}
-
-// The scoped-limit display path must label a model-scoped weekly entry with
-// its display name and show its percent, for the live shape's Fable window.
-func TestFormatScopedLimitLine_ModelScoped(t *testing.T) {
-	limits, err := serveBody(t, http.StatusOK, liveShapeBody).GetUsageLimits()
-	if err != nil {
-		t.Fatalf("expected success, got: %v", err)
-	}
-
-	var scopedLines []string
-	for _, entry := range limits.Limits {
-		if entry.Scope != nil {
-			scopedLines = append(scopedLines, formatScopedLimitLine(entry))
-		}
-	}
-	if len(scopedLines) != 1 {
-		t.Fatalf("got %d scoped lines, want 1: %v", len(scopedLines), scopedLines)
-	}
-	line := scopedLines[0]
-	if !strings.Contains(line, "Fable") {
-		t.Errorf("scoped line %q does not contain %q", line, "Fable")
-	}
-	if !strings.Contains(line, "12%") {
-		t.Errorf("scoped line %q does not contain %q", line, "12%")
-	}
-}
-
-// extra_usage only adapts to a window once pay-as-you-go is reporting a
-// utilization; otherwise it reports nothing (nil -> "--" in the menu).
-func TestExtraUsageWindow(t *testing.T) {
-	if extraUsageWindow(&UsageLimits{}) != nil {
-		t.Error("extraUsageWindow(no extra_usage) should be nil")
-	}
-	if extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{}}) != nil {
-		t.Error("extraUsageWindow(nil utilization) should be nil")
-	}
-	util := 25.0
-	w := extraUsageWindow(&UsageLimits{ExtraUsage: &ExtraUsageInfo{Utilization: &util}})
-	if w == nil || w.Utilization != 25.0 {
-		t.Errorf("extraUsageWindow(enabled 25%%) = %+v, want utilization 25", w)
-	}
-}
-
-// The status command shows what the daemon last fetched, read back from the
-// usage cache; the round trip must keep everything the display uses.
-func TestUsageCacheRoundTrip(t *testing.T) {
-	limits, err := serveBody(t, http.StatusOK, liveShapeBody).GetUsageLimits()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := json.Marshal(limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got *UsageLimits
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatal(err)
-	}
-	render := func(u *UsageLimits) string {
-		var b strings.Builder
-		for _, ind := range indicators {
-			b.WriteString(formatConsoleUsage(ind.get(u), ind.label, ""))
-		}
-		for _, entry := range u.Limits {
-			b.WriteString(formatScopedLimitLine(entry))
-		}
-		return b.String()
-	}
-	if got, want := render(got), render(limits); got != want {
-		t.Errorf("round trip changed the displayed usage:\n got %s\nwant %s", got, want)
 	}
 }

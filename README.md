@@ -6,7 +6,8 @@ A lightweight menu bar monitor that displays **real-time rate limits** from your
 
 ## Features
 
-- 5-hour session, weekly (all models), and pay-as-you-go extra usage in the menu bar; per-model weekly windows (e.g. Fable) in the terminal status
+- Every usage limit Claude reports for your plan — 5-hour session, weekly (all models), per-model weekly windows (e.g. Fable), usage credits — with any one of them in the menu bar
+- Follows your plan: the rows come from Claude's own list of limits, not a built-in one (see [Plans](#plans))
 - Traffic light indicator: 🟢 Green (0-49%), 🟡 Yellow (50-79%), 🔴 Red (80%+)
 - Refreshes every 3 minutes, backing off further when the usage endpoint rate-limits; keeps the last numbers while rate-limited, but shows "Error" if fetching keeps failing for any other reason
 - Optional live mode: updates within seconds while you use Claude Code, fed by its status line (see [Live updates](#live-updates))
@@ -39,19 +40,33 @@ The monitor reuses Claude Code's login — nothing to copy or paste. It reads Cl
 
 ```
 $ claude-monitor-lite
-✓ Already running (PID: 29525)
+✓ Already running (PID: 69953)
 
-As of 13:12:
+As of 09:39:
 === Current Usage ===
-5-Hour Session:   21%  (resets 2026-10-17 15:00, in 1h 47m)
-Weekly (All):    6%  (resets 2026-10-22 21:00, in 127h 47m)
-Extra Usage:    0%
-Weekly (Fable):    0%  (resets 2026-10-22 21:00, in 127h 48m)
+5-Hour Session:   12%  (resets 2026-11-17 14:10, in 4h 30m)
+Weekly (All):    3%  (resets 2026-11-19 20:00, in 58h 20m)
+Weekly (Fable):    3%  (resets 2026-11-19 20:00, in 58h 20m)
 
-Menu Bar Shows:  5-Hour Session (🟢 21%)
+Menu Bar Shows:  5-Hour Session (🟢 12%)
 ```
 
-**Switching metrics:** click any metric in the menu to show it in the menu bar. Only windows with data are listed.
+**Switching metrics:** click a row in the menu to pin it to the menu bar. **Auto (Claude's pick)**, the default, shows the limit Claude itself marks as the one to watch. The menu bar also falls back to it when a pinned row is no longer part of your plan.
+
+## Plans
+
+The monitor works with any plan that signs in to Claude Code with a Claude subscription. It has no built-in list of a plan's limits: the menu shows whatever the usage endpoint reports for the account, so a limit Anthropic adds or drops needs no update here.
+
+| Plan | Rows to expect |
+|---|---|
+| Pro, Max, Team | 5-hour session and weekly (all models), plus a per-model weekly row where the plan has one (e.g. Fable) |
+| Ultra | Weekly rows; a 5-hour row only until Anthropic has verified the account |
+| Enterprise | Seats with usage limits show them like Team. A usage-based seat has no plan limits, and the menu says so |
+| Any plan with usage credits turned on | A **Usage Credits** row: percent of the monthly limit and the amount spent |
+
+Checked against the usage responses of Max and Team accounts. The other rows follow Anthropic's published plan descriptions and go through the same code.
+
+Not covered, because there are no plan limits to read: API key and Console logins, Amazon Bedrock, Google Vertex AI, and the Free plan (which does not include Claude Code).
 
 ## Commands
 
@@ -87,7 +102,7 @@ claude-monitor-lite statusline install
 
 This points `statusLine.command` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) at `claude-monitor-lite statusline`, which saves the usage for the monitor and then runs your original status line command unchanged, so your status line looks the same. With no status line configured before, it stays blank. The original `settings.json` is backed up to `settings.json.claude-monitor-lite.bak`.
 
-While Claude Code is in use the menu bar then follows within seconds, at no extra API cost. Polling continues every 3 minutes for everything the status line does not carry: usage from claude.ai or the desktop app, extra usage, and per-model weekly limits. Needs a Claude.ai subscription and a Claude Code version whose status line input includes `rate_limits`; otherwise the monitor simply keeps polling.
+While Claude Code is in use the menu bar then follows within seconds, at no extra API cost. Polling continues every 3 minutes for everything the status line does not carry: usage from claude.ai or the desktop app, usage credits, and per-model weekly limits. Needs a Claude.ai subscription and a Claude Code version whose status line input includes `rate_limits`; otherwise the monitor simply keeps polling.
 
 `claude-monitor-lite statusline uninstall` restores your original command. Run it before removing the binary (e.g. `brew uninstall`), or Claude Code's status line goes blank. Install again after moving the binary (e.g. switching from a source build to Homebrew) so the status line points at the new path.
 
@@ -109,6 +124,6 @@ claude-monitor-lite uninstall
 
 ## Troubleshooting
 
-**Menu bar shows "Login":** Claude Code's login is missing or rejected. Log in to Claude Code again; the monitor picks it up on its next refresh.
+**Menu bar shows "Login":** Claude Code's login is missing, rejected, or not a Claude subscription login (an API key or Console login has no plan limits). Log in to Claude Code with your subscription; the monitor picks it up on its next refresh.
 
 **App not responding:** Run `killall claude-monitor-lite` then restart.

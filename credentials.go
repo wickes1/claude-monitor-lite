@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 )
@@ -43,9 +44,14 @@ var (
 
 // OAuthCredential is the part of Claude Code's claudeAiOauth block we use.
 type OAuthCredential struct {
-	AccessToken string `json:"accessToken"`
-	ExpiresAt   int64  `json:"expiresAt"` // epoch milliseconds
+	AccessToken string   `json:"accessToken"`
+	ExpiresAt   int64    `json:"expiresAt"` // epoch milliseconds
+	Scopes      []string `json:"scopes"`
 }
+
+// profileScope is the OAuth scope the usage endpoint requires. A claude.ai
+// subscription login has it; an inference-only token does not.
+const profileScope = "user:profile"
 
 // expired reports whether the access token is within the refresh leeway of (or
 // past) its expiry. An unknown expiry (0) is treated as usable; a 401 then
@@ -123,7 +129,12 @@ func parseCredential(data []byte) (*OAuthCredential, error) {
 		return nil, fmt.Errorf("parse credential: %w", err)
 	}
 	if f.ClaudeAiOauth == nil || f.ClaudeAiOauth.AccessToken == "" {
-		return nil, fmt.Errorf("credential has no claudeAiOauth.accessToken")
+		return nil, fmt.Errorf("Claude Code is not logged in with a Claude subscription — an API key or Console login has no plan limits to show")
+	}
+	// Without the profile scope the login cannot read plan usage; saying so
+	// beats polling into a permission error.
+	if !slices.Contains(f.ClaudeAiOauth.Scopes, profileScope) {
+		return nil, fmt.Errorf("Claude Code's login lacks the %s scope, so it cannot read plan usage — log in to Claude Code with your Claude subscription", profileScope)
 	}
 	return f.ClaudeAiOauth, nil
 }

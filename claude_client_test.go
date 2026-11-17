@@ -8,23 +8,46 @@ import (
 	"time"
 )
 
-// liveShapeBody is the usage response shape observed on 2026-10-17 (Max and
-// Team accounts), trimmed to one of each kind of field: populated windows,
-// null codename windows, extra_usage, and limits[] with an unscoped and a
-// model-scoped entry.
+// liveShapeBody is the usage response shape observed on 2026-11-17 on a Max
+// account, trimmed to one of each kind of field: populated windows, null
+// codename windows, usage credits that are switched off, and limits[] with
+// the session, weekly and model-scoped rows.
 const liveShapeBody = `{
-	"five_hour": {"utilization": 47.0, "resets_at": "2026-07-02T03:00:00.000001+00:00"},
-	"seven_day": {"utilization": 9.0, "resets_at": "2026-07-03T01:00:00.000001+00:00"},
+	"five_hour": {"utilization": 47.0, "resets_at": "2026-07-02T03:00:00.000001+00:00",
+		"limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
+	"seven_day": {"utilization": 9.0, "resets_at": "2026-07-03T01:00:00.000001+00:00",
+		"limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
 	"seven_day_opus": null,
 	"amber_gauge": null,
-	"extra_usage": {"is_enabled": false, "utilization": null},
+	"extra_usage": {"is_enabled": false, "monthly_limit": 5000, "used_credits": 0.0, "utilization": 0.0,
+		"currency": "USD", "decimal_places": 2, "disabled_reason": "out_of_credits"},
 	"limits": [
-		{"kind": "session", "percent": 47, "resets_at": "2026-07-02T03:00:00.000001+00:00", "scope": null},
-		{"kind": "weekly_scoped", "percent": 12, "resets_at": "2026-07-03T01:00:00.000002+00:00",
-		 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+		{"kind": "session", "group": "session", "percent": 47, "severity": "normal",
+		 "resets_at": "2026-07-02T03:00:00.000001+00:00", "scope": null, "is_active": true},
+		{"kind": "weekly_all", "group": "weekly", "percent": 9, "severity": "normal",
+		 "resets_at": "2026-07-03T01:00:00.000001+00:00", "scope": null, "is_active": false},
+		{"kind": "weekly_scoped", "group": "weekly", "percent": 12, "severity": "normal",
+		 "resets_at": "2026-07-03T01:00:00.000002+00:00",
+		 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
 	],
-	"spend": {"percent": 0},
-	"member_dashboard_available": false
+	"spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2}, "percent": 0, "enabled": false},
+	"member_dashboard_available": false,
+	"weekly_scoped_shares": [{"limit_index": 2, "used_percent_of_weekly": 0, "allowance_percent_of_weekly": 50}]
+}`
+
+// idleSeatBody is the shape observed on a Team seat with no session open:
+// the session row is there, at 0% with nothing to reset. The is_active values
+// are assumed; that observation did not record them.
+const idleSeatBody = `{
+	"five_hour": {"utilization": 0.0, "resets_at": null},
+	"seven_day": {"utilization": 3.0, "resets_at": "2026-07-03T01:00:00+00:00"},
+	"extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null},
+	"limits": [
+		{"kind": "session", "group": "session", "percent": 0, "severity": "normal",
+		 "resets_at": null, "scope": null, "is_active": false},
+		{"kind": "weekly_all", "group": "weekly", "percent": 3, "severity": "normal",
+		 "resets_at": "2026-07-03T01:00:00+00:00", "scope": null, "is_active": false}
+	]
 }`
 
 // serveUsage returns a client whose token provider succeeds, pointed at a test
@@ -45,37 +68,41 @@ func serveBody(t *testing.T, status int, body string) *ClaudeUsageClient {
 	})
 }
 
-// The live response must parse: populated windows with their reset times, and
-// the scoped Fable entry the console shows. Unknown and null keys must not
-// break decoding — the endpoint adds codename windows often.
+// The live response must parse: every limits[] entry with the fields the rows
+// are built from, and the usage credits. Keys this monitor does not read must
+// not break decoding — the endpoint adds fields often.
 func TestGetUsageLimits_LiveShape(t *testing.T) {
 	limits, err := serveBody(t, http.StatusOK, liveShapeBody).GetUsageLimits()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
-	if limits.FiveHour == nil || roundUtilization(limits.FiveHour.Utilization) != 47 || limits.FiveHour.ResetsAt.IsZero() {
-		t.Errorf("FiveHour = %+v, want 47%% with a reset time", limits.FiveHour)
+	if x := limits.ExtraUsage; x == nil || x.IsEnabled || x.MonthlyLimit == nil || *x.MonthlyLimit != 5000 || x.Currency != "USD" {
+		t.Errorf("ExtraUsage = %+v, want disabled with a 5000 USD limit", x)
 	}
-	if limits.SevenDay == nil || limits.SevenDay.ResetsAt.IsZero() {
-		t.Errorf("SevenDay = %+v, want a reset time", limits.SevenDay)
+	if len(limits.Limits) != 3 {
+		t.Fatalf("Limits = %+v, want 3 entries", limits.Limits)
 	}
-	if extraUsageWindow(limits) != nil {
-		t.Error("extra_usage with null utilization should report nothing")
+	if weekly := limits.Limits[1]; weekly.Kind != "weekly_all" || weekly.Percent != 9 || weekly.ResetsAt.IsZero() {
+		t.Errorf("weekly entry = %+v", weekly)
 	}
-	if len(limits.Limits) != 2 || limits.Limits[1].Scope == nil || *limits.Limits[1].Scope.Model.DisplayName != "Fable" {
-		t.Errorf("Limits = %+v, want the scoped Fable entry second", limits.Limits)
+	session, scoped := limits.Limits[0], limits.Limits[2]
+	if session.Kind != "session" || session.Percent != 47 || !session.IsActive || session.ResetsAt.IsZero() {
+		t.Errorf("session entry = %+v", session)
+	}
+	if scoped.Kind != "weekly_scoped" || scoped.IsActive || scoped.Scope == nil || scoped.Scope.Model.DisplayName != "Fable" {
+		t.Errorf("scoped entry = %+v, want the Fable weekly window", scoped)
 	}
 }
 
 // A null resets_at (a window with nothing to reset) must decode to the zero
 // time, which the display treats as "no reset", not as a parse failure.
 func TestGetUsageLimits_NullResetsAt(t *testing.T) {
-	limits, err := serveBody(t, http.StatusOK, `{"five_hour":{"utilization":0,"resets_at":null}}`).GetUsageLimits()
+	limits, err := serveBody(t, http.StatusOK, idleSeatBody).GetUsageLimits()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
-	if !limits.FiveHour.ResetsAt.IsZero() {
-		t.Errorf("ResetsAt = %v, want zero", limits.FiveHour.ResetsAt)
+	if session := limits.Limits[0]; session.Kind != "session" || !session.ResetsAt.IsZero() {
+		t.Errorf("session entry = %+v, want a zero reset time", session)
 	}
 }
 

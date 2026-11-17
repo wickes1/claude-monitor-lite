@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -177,6 +178,31 @@ func TestKeychainService(t *testing.T) {
 		t.Setenv("CLAUDE_CONFIG_DIR", dir)
 		if got := keychainService(); got != want {
 			t.Errorf("CLAUDE_CONFIG_DIR=%q: got %q, want %q", dir, got, want)
+		}
+	}
+}
+
+// Only a Claude subscription login can read plan usage. Anything else must be
+// turned away with a message that says why, instead of polling into a
+// permission error and showing "Error" forever.
+func TestParseCredentialRequiresSubscriptionLogin(t *testing.T) {
+	cases := []struct {
+		name    string
+		blob    string
+		wantErr string // "" for a usable credential
+	}{
+		{"subscription login", `{"claudeAiOauth":{"accessToken":"t","scopes":["user:inference","user:profile"]}}`, ""},
+		{"inference-only token", `{"claudeAiOauth":{"accessToken":"t","scopes":["user:inference"]}}`, "user:profile"},
+		{"no scopes at all", `{"claudeAiOauth":{"accessToken":"t"}}`, "user:profile"},
+		{"API key or Console login: no subscription block", `{"mcpOAuth":{}}`, "Claude subscription"},
+	}
+	for _, tc := range cases {
+		cred, err := parseCredential([]byte(tc.blob))
+		switch {
+		case tc.wantErr == "" && (err != nil || cred.AccessToken != "t"):
+			t.Errorf("%s: got %+v, %v; want a usable credential", tc.name, cred, err)
+		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+			t.Errorf("%s: err = %v, want one mentioning %q", tc.name, err, tc.wantErr)
 		}
 	}
 }

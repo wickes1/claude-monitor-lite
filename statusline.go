@@ -8,7 +8,7 @@
 // two windows to a file the daemon watches and then runs the user's original
 // status line command unchanged — so the menu bar follows Claude Code use
 // within seconds at no extra API cost. Polling stays as the fallback: usage
-// from claude.ai or the desktop app, extra usage and per-model windows never
+// from claude.ai or the desktop app, usage credits and per-model windows never
 // reach the status line.
 
 package main
@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -35,8 +36,11 @@ const statusLineCheckInterval = 2 * time.Second
 // statusLineInput is the part of Claude Code's status line JSON we read.
 // Each window is present only while the API reports it and its reset has not
 // passed; rate_limits itself is absent for API-key users and before the
-// session's first API response.
+// session's first API response. Behind a Claude gateway it carries a
+// spend_limit instead, which is not read: a gateway login has no claude.ai
+// plan for this monitor to poll in the first place.
 type statusLineInput struct {
+	SessionID  string `json:"session_id"`
 	RateLimits *struct {
 		FiveHour *statusLineWindow `json:"five_hour"`
 		SevenDay *statusLineWindow `json:"seven_day"`
@@ -48,35 +52,147 @@ type statusLineWindow struct {
 	ResetsAt       int64   `json:"resets_at"` // Unix epoch seconds
 }
 
+// usageLimit converts a window, or returns nil for one without a reset time:
+// the feed drops a reading once its reset passes, so a reading that never
+// resets would never leave it.
 func (w *statusLineWindow) usageLimit() *UsageLimit {
-	if w == nil {
+	if w == nil || w.ResetsAt <= 0 {
 		return nil
 	}
-	limit := &UsageLimit{Utilization: w.UsedPercentage}
-	if w.ResetsAt > 0 {
-		limit.ResetsAt = time.Unix(w.ResetsAt, 0).UTC()
-	}
-	return limit
+	return &UsageLimit{Utilization: w.UsedPercentage, ResetsAt: time.Unix(w.ResetsAt, 0).UTC()}
 }
 
-// statusLineLimits extracts the usage windows from one status line render, or
-// nil when it carries none.
-func statusLineLimits(input []byte) (*UsageLimits, error) {
+// liveWindows is the two windows the status line reports. In the usage
+// response they are the limits[] entries of kind session and weekly_all.
+type liveWindows struct {
+	FiveHour *UsageLimit
+	SevenDay *UsageLimit
+}
+
+// statusLineLimits extracts the session and its usage windows from one status
+// line render; limits is nil when the render carries none.
+func statusLineLimits(input []byte) (session string, limits *liveWindows, err error) {
 	var in statusLineInput
 	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if in.RateLimits == nil {
-		return nil, nil
+		return in.SessionID, nil, nil
 	}
-	limits := &UsageLimits{
+	limits = &liveWindows{
 		FiveHour: in.RateLimits.FiveHour.usageLimit(),
 		SevenDay: in.RateLimits.SevenDay.usageLimit(),
 	}
 	if limits.FiveHour == nil && limits.SevenDay == nil {
-		return nil, nil
+		return in.SessionID, nil, nil
 	}
-	return limits, nil
+	return in.SessionID, limits, nil
+}
+
+// statusLineFeed is the usage file: what each Claude Code session last
+// reported for each window, and when that reading last changed.
+//
+// It is kept per session because every open session re-renders its status
+// line with the rate_limits of its own last API response, so an idle session
+// repeats an old figure for as long as it stays open. A render therefore says
+// nothing about how old its numbers are; only a session's numbers changing
+// shows that a response just arrived. Ordering readings by that change is
+// what lets the daemon show the newest one, including a lower one after
+// Anthropic resets a limit in the middle of its window.
+type statusLineFeed struct {
+	Sessions map[string]*sessionWindows `json:"sessions"`
+}
+
+type sessionWindows struct {
+	FiveHour *feedWindow `json:"five_hour,omitempty"`
+	SevenDay *feedWindow `json:"seven_day,omitempty"`
+}
+
+type feedWindow struct {
+	UsageLimit
+	// ChangedAt is when the session's reading of this window last changed.
+	// It is zero for a reading recorded on first sight, whose age is unknown:
+	// the session may have been idle on that figure for hours.
+	ChangedAt time.Time `json:"changed_at"`
+}
+
+// open reports whether the window has yet to reset. Claude Code stops
+// reporting a window once its reset passes.
+func (w *feedWindow) open(now time.Time) bool {
+	return w != nil && w.ResetsAt.After(now)
+}
+
+// record folds one session's render into the feed and reports whether it
+// changed anything. Renders that repeat the session's last reading — the 2s
+// re-render, an idle session — change nothing, so the file is left alone.
+func (f *statusLineFeed) record(session string, live *liveWindows, now time.Time) bool {
+	s := f.Sessions[session]
+	if s == nil {
+		s = &sessionWindows{}
+		f.Sessions[session] = s
+	}
+	five := recordWindow(&s.FiveHour, live.FiveHour, now)
+	seven := recordWindow(&s.SevenDay, live.SevenDay, now)
+	return five || seven
+}
+
+// recordWindow stores live in slot when it differs from the reading there. A
+// window missing from the render is not news: the reading stays as it was.
+func recordWindow(slot **feedWindow, live *UsageLimit, now time.Time) bool {
+	prev := *slot
+	switch {
+	case live == nil:
+		return false
+	case prev == nil:
+		*slot = &feedWindow{UsageLimit: *live}
+		return true
+	case prev.Utilization == live.Utilization && prev.ResetsAt.Equal(live.ResetsAt):
+		return false
+	}
+	*slot = &feedWindow{UsageLimit: *live, ChangedAt: now}
+	return true
+}
+
+// prune drops the sessions that have no open window left. A session is kept
+// whole until then, expired windows included, so that its next window is
+// recognised as a change rather than a first sight.
+func (f *statusLineFeed) prune(now time.Time) {
+	for id, s := range f.Sessions {
+		if !s.FiveHour.open(now) && !s.SevenDay.open(now) {
+			delete(f.Sessions, id)
+		}
+	}
+}
+
+// liveSince returns the windows some session saw change after since, each
+// from the session whose reading changed last, or nil when there is none.
+func (f *statusLineFeed) liveSince(since, now time.Time) *liveWindows {
+	var five, seven *feedWindow
+	for _, s := range f.Sessions {
+		five = laterChange(five, s.FiveHour, now)
+		seven = laterChange(seven, s.SevenDay, now)
+	}
+	live := &liveWindows{}
+	if five != nil && five.ChangedAt.After(since) {
+		live.FiveHour = &five.UsageLimit
+	}
+	if seven != nil && seven.ChangedAt.After(since) {
+		live.SevenDay = &seven.UsageLimit
+	}
+	if live.FiveHour == nil && live.SevenDay == nil {
+		return nil
+	}
+	return live
+}
+
+func laterChange(best, w *feedWindow, now time.Time) *feedWindow {
+	if !w.open(now) || w.ChangedAt.IsZero() {
+		return best
+	}
+	if best == nil || w.ChangedAt.After(best.ChangedAt) {
+		return w
+	}
+	return best
 }
 
 // sameWindowTolerance absorbs the sub-second difference between a window's
@@ -84,11 +200,13 @@ func statusLineLimits(input []byte) (*UsageLimits, error) {
 // (22:50:00); distinct windows are hours apart.
 const sameWindowTolerance = time.Minute
 
-// newerWindow picks the more current reading of a usage window. Every open
-// Claude Code session re-renders its status line with the rate_limits of its
-// own last API response, so an idle session keeps reporting an old, lower
-// figure. Within one window utilization only grows, so the higher reading is
-// the newer one; a later reset time means a newer window altogether.
+// newerWindow picks which of a polled reading and a later status line reading
+// to show. A later reset time means a newer window altogether. Within one
+// window the higher reading wins: the endpoint counts usage the response
+// headers have not caught up with yet, so a status line reading a point below
+// the poll is lag, and showing it would make the menu bar tick backwards. A
+// real drop — a limit reset mid-window — is picked up by the next poll, which
+// replaces the base outright.
 func newerWindow(a, b *UsageLimit) *UsageLimit {
 	if a == nil {
 		return b
@@ -109,22 +227,29 @@ func newerWindow(a, b *UsageLimit) *UsageLimit {
 }
 
 // mergeStatusLine overlays the windows a status line update carries onto the
-// last full poll, keeping everything only polling can see (extra usage,
-// per-model limits). Each window keeps whichever reading is newer, so a
-// status line update can never roll back a fresher poll.
-func mergeStatusLine(base, live *UsageLimits) *UsageLimits {
-	merged := UsageLimits{}
-	if base != nil {
-		merged = *base
+// session and weekly rows of the last poll, leaving everything only polling
+// can see (usage credits, per-model limits) as polled. It only updates rows
+// the poll listed: which meters an account has is the server's to say.
+func mergeStatusLine(base *UsageLimits, live *liveWindows) *UsageLimits {
+	merged := *base
+	merged.Limits = slices.Clone(base.Limits) // base's entries stay as polled
+	for i := range merged.Limits {
+		entry := &merged.Limits[i]
+		var window *UsageLimit
+		switch entry.Kind {
+		case kindSession:
+			window = live.FiveHour
+		case kindWeeklyAll:
+			window = live.SevenDay
+		}
+		newer := newerWindow(&UsageLimit{Utilization: entry.Percent, ResetsAt: entry.ResetsAt}, window)
+		entry.Percent, entry.ResetsAt = newer.Utilization, newer.ResetsAt
 	}
-	merged.FiveHour = newerWindow(merged.FiveHour, live.FiveHour)
-	merged.SevenDay = newerWindow(merged.SevenDay, live.SevenDay)
 	return &merged
 }
 
-// statusLineUsageFile holds the newest reading of each window across all
-// Claude Code sessions' status line renders. Its mtime is when a reading last
-// advanced, which is what lets the daemon tell it apart from an older poll.
+// statusLineUsageFile holds the status line feed. Its mtime is when some
+// session's reading last changed.
 func statusLineUsageFile() string {
 	return instanceFile(".statusline-usage.json")
 }
@@ -190,35 +315,47 @@ func runStatusLine() {
 	}
 }
 
-// saveStatusLineUsage folds the render's windows into the usage file, keeping
-// the newer reading of each. Renders that advance nothing — the 2s re-render,
-// or an idle session repeating an old figure — leave the file untouched, so
-// its mtime stays the time a reading last moved.
+// saveStatusLineUsage folds the render into the feed. A render that changes
+// nothing leaves the file untouched, so its mtime stays the time a reading
+// last moved.
 //
 // The read-merge-write is unlocked: two sessions saving in the same instant
-// can drop the higher reading, but the active session restores it on its next
-// 2s render, which is cheaper than a file lock on every render.
+// can drop one's reading, but that session records it again on its next
+// render, which is cheaper than a file lock on every render.
 func saveStatusLineUsage(input []byte) error {
-	limits, err := statusLineLimits(input)
+	session, limits, err := statusLineLimits(input)
 	if err != nil || limits == nil {
 		return err
 	}
-	path := statusLineUsageFile()
-	old, err := os.ReadFile(path)
-	if err == nil {
-		var prev UsageLimits
-		if json.Unmarshal(old, &prev) == nil {
-			limits = mergeStatusLine(&prev, limits)
-		}
+	// An unreadable feed (a crash can leave the file empty) is replaced
+	// rather than repaired.
+	feed, _ := readStatusLineFeed()
+	now := time.Now()
+	if !feed.record(session, limits, now) {
+		return nil
 	}
-	data, err := json.Marshal(limits)
+	feed.prune(now)
+	data, err := json.Marshal(feed)
 	if err != nil {
 		return err
 	}
-	if bytes.Equal(old, data) {
-		return nil
+	return writeFileAtomic(statusLineUsageFile(), data, configFilePermissions)
+}
+
+// readStatusLineFeed reads the feed; a missing file is an empty feed. It
+// always returns a usable feed, alongside the error when the file is bad.
+func readStatusLineFeed() (*statusLineFeed, error) {
+	feed := &statusLineFeed{}
+	data, err := os.ReadFile(statusLineUsageFile())
+	if err == nil {
+		err = json.Unmarshal(data, feed)
+	} else if os.IsNotExist(err) {
+		err = nil
 	}
-	return writeFileAtomic(path, data, configFilePermissions)
+	if err != nil || feed.Sessions == nil {
+		feed.Sessions = make(map[string]*sessionWindows)
+	}
+	return feed, err
 }
 
 // logStatusLineError appends to this instance's log. Stdout is the user's
@@ -233,11 +370,11 @@ func logStatusLineError(err error) {
 	log.New(f, "", log.LstdFlags).Printf("statusline: %v", err)
 }
 
-// readStatusLineUpdate returns the status line usage if it changed after
-// since, or nil.
-func readStatusLineUpdate(since time.Time) (*UsageLimits, time.Time, error) {
-	path := statusLineUsageFile()
-	info, err := os.Stat(path)
+// readStatusLineUpdate returns the feed if its file changed after since, or
+// nil. The returned time is the file's mtime, advanced past a bad write too,
+// so that one is reported once rather than on every tick.
+func readStatusLineUpdate(since time.Time) (*statusLineFeed, time.Time, error) {
+	info, err := os.Stat(statusLineUsageFile())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, since, nil
@@ -247,16 +384,11 @@ func readStatusLineUpdate(since time.Time) (*UsageLimits, time.Time, error) {
 	if !info.ModTime().After(since) {
 		return nil, since, nil
 	}
-	data, err := os.ReadFile(path)
+	feed, err := readStatusLineFeed()
 	if err != nil {
-		return nil, since, err
-	}
-	var limits UsageLimits
-	if err := json.Unmarshal(data, &limits); err != nil {
-		// Advance past the bad write so it is reported once, not every tick.
 		return nil, info.ModTime(), err
 	}
-	return &limits, info.ModTime(), nil
+	return feed, info.ModTime(), nil
 }
 
 // --- install / uninstall ---------------------------------------------------

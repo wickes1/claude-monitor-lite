@@ -48,36 +48,35 @@ func TestWriteFileAtomic(t *testing.T) {
 	}
 }
 
-// Every indicator must survive a save/load round-trip, so any metric the menu
-// offers can actually be persisted as the selected one.
-func TestConfigRoundTripsEveryIndicator(t *testing.T) {
+// A selection must survive a save/load round-trip — including a scoped row's
+// key, which carries a colon and a model name — or a click would not stick.
+func TestConfigRoundTripsSelection(t *testing.T) {
 	withTempHome(t)
-	for _, ind := range indicators {
-		if err := SaveConfig(Config{MenuBarIndicator: ind.key}); err != nil {
-			t.Fatalf("save %q failed: %v", ind.key, err)
+	for _, key := range []string{autoKey, kindSession, kindWeeklyAll, "weekly_scoped:Fable", extraUsageKey} {
+		if err := SaveConfig(Config{MenuBarIndicator: key}); err != nil {
+			t.Fatalf("save %q failed: %v", key, err)
 		}
-		if got := LoadConfig().MenuBarIndicator; got != ind.key {
-			t.Errorf("indicator %q not preserved, got %q", ind.key, got)
+		if got := LoadConfig().MenuBarIndicator; got != key {
+			t.Errorf("selection %q not preserved, got %q", key, got)
 		}
 	}
 }
 
-// A missing config, an unreadable one, or an unknown indicator key must all
-// load as the default indicator rather than an empty selection.
-func TestLoadConfigFallsBackToDefault(t *testing.T) {
+// With nothing chosen — a missing or unreadable config — the menu bar follows
+// the server's pick, so a plan without a 5-hour limit does not start on "--".
+func TestLoadConfigDefaultsToAuto(t *testing.T) {
 	home := withTempHome(t)
 	path := filepath.Join(home, ".claude-monitor-lite.json")
-	want := indicators[0].key
 
-	if got := LoadConfig().MenuBarIndicator; got != want {
-		t.Errorf("missing config: indicator = %q, want %q", got, want)
+	if got := LoadConfig().MenuBarIndicator; got != autoKey {
+		t.Errorf("missing config: selection = %q, want %q", got, autoKey)
 	}
-	for _, body := range []string{`not json`, `{"menuBarIndicator":"staleKey"}`} {
+	for _, body := range []string{`not json`, `{}`, `{"menuBarIndicator":""}`} {
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if got := LoadConfig().MenuBarIndicator; got != want {
-			t.Errorf("config %s: indicator = %q, want %q", body, got, want)
+		if got := LoadConfig().MenuBarIndicator; got != autoKey {
+			t.Errorf("config %s: selection = %q, want %q", body, got, autoKey)
 		}
 	}
 }

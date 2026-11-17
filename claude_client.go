@@ -75,40 +75,54 @@ func NewUsageClient(tokenProvider func() (string, error)) *ClaudeUsageClient {
 // UsageLimits holds the parts of the usage response this monitor displays.
 // The endpoint also returns many codename windows that are null on every
 // account observed; they are left out rather than tracked.
+//
+// Limits is the server's own list of the meters this account has, and is what
+// the menu is built from (rows.go).
 type UsageLimits struct {
-	FiveHour   *UsageLimit     `json:"five_hour"`
-	SevenDay   *UsageLimit     `json:"seven_day"`
 	ExtraUsage *ExtraUsageInfo `json:"extra_usage"`
 	Limits     []LimitEntry    `json:"limits"`
 }
 
+// UsageLimit is one reading of a meter: how full it is and when it empties.
 type UsageLimit struct {
 	Utilization float64   `json:"utilization"`
 	ResetsAt    time.Time `json:"resets_at"` // zero when the window has no reset
 }
 
-// ExtraUsageInfo is pay-as-you-go credit state; Utilization stays null until
-// pay-as-you-go is turned on.
+// ExtraUsageInfo is the usage credits that cover sends past the plan's limits.
+// Amounts are in minor units of Currency (cents for USD).
 type ExtraUsageInfo struct {
-	Utilization *float64 `json:"utilization"`
+	// IsEnabled is false while credits cannot cover a send: turned off, or
+	// out of credits. The other fields keep reporting either way.
+	IsEnabled     bool     `json:"is_enabled"`
+	MonthlyLimit  *float64 `json:"monthly_limit"` // null when spend is uncapped
+	UsedCredits   *float64 `json:"used_credits"`
+	Utilization   *float64 `json:"utilization"` // null without a monthly limit
+	Currency      string   `json:"currency"`
+	DecimalPlaces *int     `json:"decimal_places"`
 }
 
-// LimitEntry is one entry in limits[]. Only scoped entries (a weekly window
-// narrowed to one model) are displayed: the unscoped ones repeat five_hour and
-// seven_day.
+// LimitEntry is one entry in limits[]: a meter the server says this account
+// has. Which kinds appear depends on the plan, so nothing here is assumed to
+// be present.
 type LimitEntry struct {
+	Kind     string      `json:"kind"` // "session", "weekly_all", "weekly_scoped", …
 	Percent  float64     `json:"percent"`
 	ResetsAt time.Time   `json:"resets_at"`
 	Scope    *LimitScope `json:"scope"`
+	// IsActive marks the entry the server picks for a display with room for
+	// one number.
+	IsActive bool `json:"is_active"`
 }
 
+// LimitScope narrows an entry to one model or one surface.
 type LimitScope struct {
-	Model *LimitScopeModel `json:"model"`
+	Model   *LimitScopeName `json:"model"`
+	Surface *LimitScopeName `json:"surface"`
 }
 
-type LimitScopeModel struct {
-	ID          *string `json:"id"`
-	DisplayName *string `json:"display_name"`
+type LimitScopeName struct {
+	DisplayName string `json:"display_name"`
 }
 
 // GetUsageLimits fetches the current usage. Errors are classified for the

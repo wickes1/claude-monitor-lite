@@ -39,9 +39,16 @@ var version = "dev"
 const githubURL = "https://github.com/wickes1/claude-monitor-lite"
 
 var (
-	// indicatorMenuItems holds the systray menu items, parallel to the
-	// indicators table. Populated once in onReady.
-	indicatorMenuItems []*systray.MenuItem
+	// rowMenuItems is a fixed pool of menu items for the usage rows; item i
+	// shows row i and the rest stay hidden. A pool because the rows are only
+	// known once usage arrives, while systray can only append items — a row
+	// added later would land below Quit. Populated once in onReady.
+	rowMenuItems []*systray.MenuItem
+	// autoMenuItem returns the menu bar to the server's pick.
+	autoMenuItem *systray.MenuItem
+	// statusMenuItem says why there are no numbers: loading, not logged in,
+	// a failing fetch, a plan without limits. Hidden otherwise.
+	statusMenuItem *systray.MenuItem
 
 	appConfig    Config
 	pidFile      string
@@ -65,43 +72,10 @@ var (
 	appCancel context.CancelFunc
 )
 
-// indicator is one selectable usage metric: a stable config key, a menu label,
-// and how to pull its window out of a usage response. This table is the single
-// source of truth — menu items, config validation, display and selection all
-// derive from it, so a new API field means adding exactly one row here.
-type indicator struct {
-	key   string
-	label string
-	get   func(*UsageLimits) *UsageLimit
-}
-
-// indicators lists the selectable metrics; the first is the default.
-var indicators = []indicator{
-	{"currentSession", "5-Hour Session", func(u *UsageLimits) *UsageLimit { return u.FiveHour }},
-	{"weeklyAll", "Weekly (All)", func(u *UsageLimits) *UsageLimit { return u.SevenDay }},
-	{"extraUsage", "Extra Usage", extraUsageWindow},
-}
-
-// extraUsageWindow adapts the pay-as-you-go extra_usage object to the window
-// shape so it can be displayed like any other metric. It has no reset time and
-// reports nothing until pay-as-you-go is enabled and reporting a utilization.
-func extraUsageWindow(u *UsageLimits) *UsageLimit {
-	if u.ExtraUsage == nil || u.ExtraUsage.Utilization == nil {
-		return nil
-	}
-	return &UsageLimit{Utilization: *u.ExtraUsage.Utilization}
-}
-
-// findIndicator returns the indicator for key, or the first (default) entry
-// and false when key is unknown.
-func findIndicator(key string) (indicator, bool) {
-	for i := range indicators {
-		if indicators[i].key == key {
-			return indicators[i], true
-		}
-	}
-	return indicators[0], false
-}
+// maxMenuRows is the size of the row pool. Accounts observed so far report
+// three or four rows; rows past the pool are left off the menu but still
+// printed by the status command.
+const maxMenuRows = 12
 
 func getMenuBarIndicator() string {
 	indicatorMutex.RLock()
@@ -170,97 +144,59 @@ func formatResetTime(resetTime time.Time) string {
 		local.Year(), local.Month(), local.Day(), hour, roundedMinutes)
 }
 
-// Helper function to format a single usage limit with reset time
-func formatUsageWithReset(limit *UsageLimit, label string) string {
-	if limit == nil {
-		return fmt.Sprintf("%s --", label)
-	}
-
-	utilization := roundUtilization(limit.Utilization)
-	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAt)
-
-	// Special case: no active session (0% with no reset time)
-	if !hasTime && utilization == 0 {
-		return fmt.Sprintf("%s %d%% (no active session)", label, utilization)
-	}
-
-	if hasTime {
-		return fmt.Sprintf("%s %d%% (resets %s, in %dh %dm)",
-			label, utilization, formatResetTime(limit.ResetsAt), hours, minutes)
-	}
-
-	return fmt.Sprintf("%s %d%%", label, utilization)
-}
-
-// Helper function to format usage limit for console display
-func formatConsoleUsage(limit *UsageLimit, label string, noSessionMsg string) string {
-	if limit == nil {
-		return fmt.Sprintf("%s  --\n", label)
-	}
-
-	utilization := roundUtilization(limit.Utilization)
-	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAt)
-
-	if hasTime {
-		return fmt.Sprintf("%s  %3d%%  (resets %s, in %dh %dm)\n",
-			label, utilization, formatResetTime(limit.ResetsAt), hours, minutes)
-	}
-
-	if noSessionMsg != "" {
-		return fmt.Sprintf("%s  %3d%%  (%s)\n", label, utilization, noSessionMsg)
-	}
-	return fmt.Sprintf("%s  %3d%%\n", label, utilization)
-}
-
-// scopedLimitLabel builds the console label for a model-scoped
-// limits[] entry, e.g. "Weekly (Fable)". It prefers the model display name,
-// falls back to the model ID, and finally to a generic "Scoped" label when
-// neither is present.
-func scopedLimitLabel(entry LimitEntry) string {
-	if entry.Scope != nil && entry.Scope.Model != nil {
-		if entry.Scope.Model.DisplayName != nil {
-			return fmt.Sprintf("Weekly (%s)", *entry.Scope.Model.DisplayName)
+// rowDetail is what follows a row's percentage: when it resets, or failing
+// that the row's note.
+func rowDetail(row usageRow) string {
+	if row.limit != nil {
+		if hours, minutes, ok := calculateTimeUntilReset(row.limit.ResetsAt); ok {
+			return fmt.Sprintf("resets %s, in %dh %dm", formatResetTime(row.limit.ResetsAt), hours, minutes)
 		}
-		if entry.Scope.Model.ID != nil {
-			return fmt.Sprintf("Weekly (%s)", *entry.Scope.Model.ID)
+		// The 5-hour window opens with the first message, so a session with
+		// nothing to reset has not started.
+		if row.key == kindSession {
+			return "no active session"
 		}
 	}
-	return "Weekly (Scoped)"
+	return row.note
 }
 
-// formatScopedLimitLine renders one model-scoped limits[] entry as a console
-// line, in the same format as formatConsoleUsage.
-func formatScopedLimitLine(entry LimitEntry) string {
-	limit := &UsageLimit{Utilization: entry.Percent, ResetsAt: entry.ResetsAt}
-	return formatConsoleUsage(limit, scopedLimitLabel(entry)+":", "")
+// formatRow renders a row as a menu item title, or as a line of the status
+// command's output when console is set.
+func formatRow(row usageRow, console bool) string {
+	gap, value := " ", "--"
+	if console {
+		gap = "  "
+	}
+	if row.limit != nil {
+		value = fmt.Sprintf("%d%%", roundUtilization(row.limit.Utilization))
+		if console {
+			value = fmt.Sprintf("%4s", value)
+		}
+	}
+	text := row.label + ":" + gap + value
+	if detail := rowDetail(row); detail != "" {
+		text += gap + "(" + detail + ")"
+	}
+	return text
 }
 
-// Helper function to display usage stats. Windows with no data are skipped to
-// match the menu, except the 5-hour session, which is always shown as the
-// headline metric.
+// displayUsageStats prints every usage row, including any the menu's row pool
+// has no room for.
 func displayUsageStats(limits *UsageLimits) {
 	fmt.Println("=== Current Usage ===")
-	for i := range indicators {
-		limit := indicators[i].get(limits)
-		isCurrentSession := indicators[i].key == "currentSession"
-		if limit == nil && !isCurrentSession {
-			continue
-		}
-		noSessionMsg := ""
-		if isCurrentSession {
-			noSessionMsg = "no active session"
-		}
-		fmt.Print(formatConsoleUsage(limit, indicators[i].label+":", noSessionMsg))
+	rows := usageRows(limits)
+	for _, row := range rows {
+		fmt.Println(formatRow(row, true))
 	}
-	// Scoped limits (a weekly window narrowed to one model) are display only,
-	// not selectable indicators.
-	for _, entry := range limits.Limits {
-		if entry.Scope != nil {
-			fmt.Print(formatScopedLimitLine(entry))
-		}
+	if len(rows) == 0 {
+		fmt.Println(noLimitsMessage)
 	}
 	fmt.Println()
 }
+
+// noLimitsMessage is shown when a usage response lists no meter at all — a
+// seat billed by usage, with no plan limits to count against.
+const noLimitsMessage = "No usage limits reported for this plan"
 
 // setMenuBarTitle prefixes the title with the instance name so side-by-side
 // monitors (one per CLAUDE_CONFIG_DIR) are told apart at a glance.
@@ -271,25 +207,18 @@ func setMenuBarTitle(title string) {
 	systray.SetTitle(title)
 }
 
-// Helper function to update menu bar display
-func updateMenuBarDisplay(limits *UsageLimits) {
-	selected, _ := findIndicator(getMenuBarIndicator())
-	limit := selected.get(limits)
-
-	if limit == nil {
-		setMenuBarTitle("⚪ --")
-		return
+// menuBarTitle is the menu bar text for the headline row; ok is false when
+// there is no row to show.
+func menuBarTitle(row usageRow, ok bool) string {
+	if !ok || row.limit == nil {
+		return "⚪ --"
 	}
-
-	utilization := roundUtilization(limit.Utilization)
-	hours, minutes, hasTime := calculateTimeUntilReset(limit.ResetsAt)
-	color := getColorIndicator(limit.Utilization)
-
-	if hasTime {
-		setMenuBarTitle(fmt.Sprintf("%s %d%% (%dh%dm)", color, utilization, hours, minutes))
-	} else {
-		setMenuBarTitle(fmt.Sprintf("%s %d%%", color, utilization))
+	utilization := roundUtilization(row.limit.Utilization)
+	color := getColorIndicator(row.limit.Utilization)
+	if hours, minutes, hasTime := calculateTimeUntilReset(row.limit.ResetsAt); hasTime {
+		return fmt.Sprintf("%s %d%% (%dh%dm)", color, utilization, hours, minutes)
 	}
+	return fmt.Sprintf("%s %d%%", color, utilization)
 }
 
 func main() {
@@ -386,15 +315,18 @@ func handleStatusDisplay() {
 
 	displayUsageStats(limits)
 
-	// Show which indicator is displayed in menu bar
-	selected, _ := findIndicator(getMenuBarIndicator())
-	limit := selected.get(limits)
-	utilization := 0.0
-	if limit != nil {
-		utilization = limit.Utilization
+	row, auto, ok := headlineRow(usageRows(limits), getMenuBarIndicator())
+	if !ok {
+		return
 	}
-
-	fmt.Printf("Menu Bar Shows:  %s (%s %d%%)\n", selected.label, getColorIndicator(utilization), roundUtilization(utilization))
+	value := "--"
+	if row.limit != nil {
+		value = fmt.Sprintf("%s %d%%", getColorIndicator(row.limit.Utilization), roundUtilization(row.limit.Utilization))
+	}
+	if auto {
+		value += ", Claude's pick"
+	}
+	fmt.Printf("Menu Bar Shows:  %s (%s)\n", row.label, value)
 }
 
 func handleStart() {
@@ -549,9 +481,16 @@ func onReady() {
 
 	claudeClient = NewUsageClient(CurrentOAuthToken)
 
-	indicatorMenuItems = make([]*systray.MenuItem, len(indicators))
-	for i := range indicators {
-		indicatorMenuItems[i] = systray.AddMenuItem(indicators[i].label+": --", "Click to show in menu bar")
+	statusMenuItem = systray.AddMenuItem("Loading…", "")
+	statusMenuItem.Disable()
+	rowMenuItems = make([]*systray.MenuItem, maxMenuRows)
+	for i := range rowMenuItems {
+		rowMenuItems[i] = systray.AddMenuItem("", "Click to show in menu bar")
+		rowMenuItems[i].Hide()
+	}
+	autoMenuItem = systray.AddMenuItem(autoMenuTitle, "Menu bar shows the limit Claude marks as the one to watch")
+	if getMenuBarIndicator() == autoKey {
+		autoMenuItem.Check()
 	}
 	systray.AddSeparator()
 
@@ -561,28 +500,28 @@ func onReady() {
 
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
-	updateMenuCheckmarks()
-
 	// A single worker owns all usage fetching, so updateStats never runs
 	// concurrently with itself.
 	go runUpdateWorker(appCtx)
 
-	// One goroutine per indicator forwards its clicks — the indicator count is
-	// dynamic, so a single static select cannot cover them.
-	for i := range indicators {
+	// One goroutine per row item forwards its clicks — a single static select
+	// cannot cover a pool.
+	for i := range rowMenuItems {
 		go func(idx int) {
 			for {
 				select {
 				case <-appCtx.Done():
 					return
-				case <-indicatorMenuItems[idx].ClickedCh:
-					selectIndicator(indicators[idx].key)
+				case <-rowMenuItems[idx].ClickedCh:
+					if key, ok := rowKeyAt(idx); ok {
+						selectIndicator(key)
+					}
 				}
 			}
 		}(i)
 	}
 
-	// Event loop — handles non-indicator menu interaction.
+	// Event loop — handles the rest of the menu.
 	go func() {
 		for {
 			select {
@@ -592,6 +531,8 @@ func onReady() {
 				appCancel()
 				systray.Quit()
 				return
+			case <-autoMenuItem.ClickedCh:
+				selectIndicator(autoKey)
 			case <-mRefresh.ClickedCh:
 				requestRefresh()
 			case <-mAbout.ClickedCh:
@@ -601,8 +542,27 @@ func onReady() {
 	}()
 }
 
-// selectIndicator switches which usage metric the menu bar shows, updating the
-// display immediately from cached data so the click feels instant.
+// autoMenuTitle is the auto item's title while a row is pinned instead.
+const autoMenuTitle = "Auto (Claude's pick)"
+
+// rowKeyAt returns the key of the row menu item idx currently shows.
+func rowKeyAt(idx int) (string, bool) {
+	limitsMutex.RLock()
+	cached := lastLimits
+	limitsMutex.RUnlock()
+	if cached == nil {
+		return "", false
+	}
+	rows := usageRows(cached)
+	if idx >= len(rows) {
+		return "", false
+	}
+	return rows[idx].key, true
+}
+
+// selectIndicator switches which usage row the menu bar shows — a row key, or
+// autoKey for the server's pick — redrawing immediately from cached data so
+// the click feels instant.
 func selectIndicator(key string) {
 	// Saving under the same lock keeps rapid clicks from persisting out of order.
 	indicatorMutex.Lock()
@@ -612,16 +572,12 @@ func selectIndicator(key string) {
 	if err != nil {
 		log.Printf("Failed to save menu bar indicator: %v", err)
 	}
-	updateMenuCheckmarks()
 
 	limitsMutex.RLock()
 	cached := lastLimits
 	limitsMutex.RUnlock()
 	if cached != nil {
-		// Re-apply visibility: the newly deselected window may now hide, and
-		// the newly selected one must show even if it has no data.
-		applyIndicatorMenu(cached)
-		updateMenuBarDisplay(cached)
+		applyMenu(cached)
 	}
 }
 
@@ -635,32 +591,51 @@ if button returned of result is "View on GitHub" then open location "%s"`, versi
 	}
 }
 
-func updateMenuCheckmarks() {
-	current := getMenuBarIndicator()
-	for i := range indicators {
-		if indicators[i].key == current {
-			indicatorMenuItems[i].Check()
-		} else {
-			indicatorMenuItems[i].Uncheck()
-		}
-	}
+// showMenuStatus puts a one-line explanation at the top of the menu.
+func showMenuStatus(text string) {
+	statusMenuItem.SetTitle(text)
+	statusMenuItem.Show()
 }
 
-// applyIndicatorMenu refreshes every indicator menu item's title from limits and
-// hides the ones with no data, so the menu is not cluttered with permanently
-// empty windows. The selected indicator always stays visible — hiding it would
-// hide its checkmark and leave the user unable to see their current choice.
-func applyIndicatorMenu(limits *UsageLimits) {
-	selected := getMenuBarIndicator()
-	for i := range indicators {
-		limit := indicators[i].get(limits)
-		indicatorMenuItems[i].SetTitle(formatUsageWithReset(limit, indicators[i].label+":"))
-		if limit != nil || indicators[i].key == selected {
-			indicatorMenuItems[i].Show()
-		} else {
-			indicatorMenuItems[i].Hide()
+// applyMenu redraws the usage rows, the checkmark and the menu bar title from
+// limits. The checkmark sits on the pinned row, or on the auto item while the
+// menu bar follows the server's pick — which then names the row it picked.
+func applyMenu(limits *UsageLimits) {
+	rows := usageRows(limits)
+	head, auto, ok := headlineRow(rows, getMenuBarIndicator())
+
+	for i, item := range rowMenuItems {
+		if i >= len(rows) {
+			item.Hide()
+			continue
 		}
+		item.SetTitle(formatRow(rows[i], false))
+		if ok && !auto && rows[i].key == head.key {
+			item.Check()
+		} else {
+			item.Uncheck()
+		}
+		item.Show()
 	}
+
+	switch {
+	case auto && ok:
+		autoMenuItem.SetTitle("Auto: " + head.label)
+		autoMenuItem.Check()
+	case auto:
+		autoMenuItem.SetTitle(autoMenuTitle)
+		autoMenuItem.Check()
+	default:
+		autoMenuItem.SetTitle(autoMenuTitle)
+		autoMenuItem.Uncheck()
+	}
+
+	if len(rows) == 0 {
+		showMenuStatus(noLimitsMessage)
+	} else {
+		statusMenuItem.Hide()
+	}
+	setMenuBarTitle(menuBarTitle(head, ok))
 }
 
 // maxTransientErrors is the number of consecutive transient failures tolerated
@@ -752,11 +727,20 @@ func requestRefresh() {
 	}
 }
 
-// lastUpdateAt is when the displayed usage was last current — a successful
-// poll, or the change time of an applied status line update. Starting at
-// process start keeps a status line file left over from before the daemon
-// ran from being shown as current. Touched only by the update worker.
-var lastUpdateAt = time.Now()
+// The update worker's view of the two usage sources. Touched only by the
+// update worker.
+var (
+	// polledLimits is what the last successful poll returned: the base that
+	// status line readings are laid over.
+	polledLimits *UsageLimits
+	// lastPollAt is when that poll was sent. Only a status line reading that
+	// changed after it can add to what the poll said. Starting at process
+	// start keeps a reading left over from before the daemon ran from being
+	// shown as current.
+	lastPollAt = time.Now()
+	// statusLineSeenAt is the mtime of the status line feed last looked at.
+	statusLineSeenAt time.Time
+)
 
 // runUpdateWorker is the single goroutine that fetches usage data — on a timer
 // and on demand. Confining fetches to one goroutine means updateStats never
@@ -830,20 +814,16 @@ func updateStats() time.Duration {
 
 		action := classifyUpdate(err, count, haveLastLimits())
 
-		// The error message goes on the first item, which must be visible even
-		// if auto-hide had hidden it (e.g. the 5-hour window had no data).
 		switch action {
 		case actionShowAuth:
-			indicatorMenuItems[0].Show()
-			indicatorMenuItems[0].SetTitle("Not logged in to Claude Code")
+			showMenuStatus("No Claude subscription login in Claude Code")
 			setMenuBarTitle("⚪ Login")
 		case actionKeepStale:
 			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
 		case actionShowError:
 			log.Printf("Error fetching usage: %v", err)
 			setMenuBarTitle("⚪ Error")
-			indicatorMenuItems[0].Show()
-			indicatorMenuItems[0].SetTitle("Error loading data")
+			showMenuStatus("Error loading data")
 		}
 		return delay
 	}
@@ -854,40 +834,45 @@ func updateStats() time.Duration {
 	consecutiveRateLimits = 0
 	consecutiveMutex.Unlock()
 
-	lastUpdateAt = polledAt
+	polledLimits, lastPollAt = limits, polledAt
+	// A reading that changed while the request was in flight is newer than
+	// this poll, and the tick that applied it will not fire again for it.
+	feed, _ := readStatusLineFeed()
+	if live := feed.liveSince(polledAt, time.Now()); live != nil {
+		limits = mergeStatusLine(limits, live)
+	}
 	showLimits(limits)
 	return refreshInterval
 }
 
-// applyStatusLineUpdate shows usage from a status line render newer than the
-// displayed data, layered over the last poll.
+// applyStatusLineUpdate lays the status line readings that changed after the
+// last poll over it. It runs when the feed file changes; a change that brings
+// nothing newer than the poll leaves the display alone.
 func applyStatusLineUpdate() {
-	live, changedAt, err := readStatusLineUpdate(lastUpdateAt)
+	feed, seenAt, err := readStatusLineUpdate(statusLineSeenAt)
+	statusLineSeenAt = seenAt
 	if err != nil {
 		log.Printf("Failed to read status line usage: %v", err)
 		return
 	}
-	if live == nil {
+	// Before the first poll there are no rows for a reading to update.
+	if feed == nil || polledLimits == nil {
 		return
 	}
-	lastUpdateAt = changedAt
-
-	limitsMutex.RLock()
-	base := lastLimits
-	limitsMutex.RUnlock()
-	showLimits(mergeStatusLine(base, live))
+	if live := feed.liveSince(lastPollAt, time.Now()); live != nil {
+		showLimits(mergeStatusLine(polledLimits, live))
+	}
 }
 
 // showLimits makes limits the displayed usage: menu items, menu bar, and the
 // cache the status command reads.
 func showLimits(limits *UsageLimits) {
-	// Refresh every indicator's title and hide the ones with no data.
-	applyIndicatorMenu(limits)
-
 	// Store limits for instant display switching (thread-safe)
 	limitsMutex.Lock()
 	lastLimits = limits
 	limitsMutex.Unlock()
+
+	applyMenu(limits)
 
 	// The status command reads this instead of calling the API itself, which
 	// would spend the same per-account rate-limit budget as this poll.
@@ -896,9 +881,6 @@ func showLimits(limits *UsageLimits) {
 			log.Printf("Failed to write usage cache: %v", err)
 		}
 	}
-
-	// Update menu bar display
-	updateMenuBarDisplay(limits)
 }
 
 func onExit() {

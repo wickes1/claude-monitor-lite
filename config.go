@@ -10,8 +10,9 @@ import (
 
 const configFilePermissions = 0600 // Owner read/write only
 
-// Config is the monitor's own settings — only which metric the menu bar shows.
-// Credentials are never stored here (see credentials.go).
+// Config is the monitor's own settings — only which metric the menu bar shows:
+// a row key (rows.go), or autoKey to follow the server's pick. Credentials are
+// never stored here (see credentials.go).
 type Config struct {
 	MenuBarIndicator string `json:"menuBarIndicator"`
 }
@@ -58,15 +59,17 @@ func GetConfigPath() string {
 	return instanceFile(".json")
 }
 
-// LoadConfig reads the config, falling back to the default indicator when the
-// file is missing, unreadable, or names an unknown indicator.
+// LoadConfig reads the config, falling back to following the server's pick
+// when the file is missing, unreadable, or names no row. A key is not checked
+// against the rows here: which rows exist is only known once usage arrives,
+// and headlineRow handles a pinned row the account does not have.
 func LoadConfig() Config {
 	var config Config
 	if data, err := os.ReadFile(GetConfigPath()); err == nil {
 		_ = json.Unmarshal(data, &config)
 	}
-	if _, ok := findIndicator(config.MenuBarIndicator); !ok {
-		config.MenuBarIndicator = indicators[0].key
+	if config.MenuBarIndicator == "" {
+		config.MenuBarIndicator = autoKey
 	}
 	return config
 }
