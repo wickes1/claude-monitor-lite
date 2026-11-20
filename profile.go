@@ -75,6 +75,16 @@ func (p profile) folder() string {
 	return name
 }
 
+// String names the profile in messages: its dir, or defaultProfileName —
+// the word the commands take for the default environment, whose directory
+// given as a path would be a different profile.
+func (p profile) String() string {
+	if p.dir == "" {
+		return defaultProfileName + " (~/.claude)"
+	}
+	return p.dir
+}
+
 // dirHash is Claude Code's 8-hex-char hash of the config dir.
 func (p profile) dirHash() string {
 	sum := sha256.Sum256([]byte(p.dir))

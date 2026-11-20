@@ -84,7 +84,7 @@ claude-monitor-lite version      # Show version
 
 ## Which login it reads
 
-The monitor reads Claude Code's own login: the default environment, `~/.claude`, unless told otherwise. It is read-only toward the credential store: it never writes a Keychain item or credentials file and never refreshes a token — the login is owned by Claude Code. On macOS the credential is the `Claude Code-credentials` Keychain item, or `Claude Code-credentials-<sha256(dir)[:8]>` for a `CLAUDE_CONFIG_DIR` environment (Claude Code's own naming); on Linux it is `<dir>/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)).
+The monitor reads Claude Code's own login: that of the default environment, `~/.claude`, plus any you [add](#several-accounts). It does not follow `CLAUDE_CONFIG_DIR` in its own environment; only the `statusline` commands do. It is read-only toward the credential store: it never writes a Keychain item or credentials file and never refreshes a token — the login is owned by Claude Code. On macOS the credential is the `Claude Code-credentials` Keychain item, or `Claude Code-credentials-<sha256(dir)[:8]>` for a `CLAUDE_CONFIG_DIR` environment (Claude Code's own naming); on Linux it is `<dir>/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)).
 
 ## Several accounts
 
@@ -93,6 +93,8 @@ Claude Code keeps a second account apart by running with `CLAUDE_CONFIG_DIR` set
 ```bash
 claude-monitor-lite add ~/.claude-work
 ```
+
+The environment has to be logged in already (`CLAUDE_CONFIG_DIR=~/.claude-work claude`, then `/login`). If it is your only login, add it and then `claude-monitor-lite remove default`.
 
 The menu then has one group per environment, each with the same rows as before:
 
@@ -125,7 +127,7 @@ This points `statusLine.command` in `~/.claude/settings.json` (or `$CLAUDE_CONFI
 
 While Claude Code is in use the menu bar then follows within seconds, at no extra API cost. Polling continues every 3 minutes for everything the status line does not carry: usage from claude.ai or the desktop app, usage credits, and per-model weekly limits. Needs a Claude.ai subscription and a Claude Code version whose status line input includes `rate_limits`; otherwise the monitor simply keeps polling.
 
-The command acts on the environment it is run in, like Claude Code itself. For an added environment, run it with that directory: `CLAUDE_CONFIG_DIR=~/.claude-work claude-monitor-lite statusline install`.
+Unlike the rest of the monitor, this command acts on the environment it is run in, like Claude Code itself. For an added environment, run it with that directory: `CLAUDE_CONFIG_DIR=~/.claude-work claude-monitor-lite statusline install`.
 
 `claude-monitor-lite statusline uninstall` restores your original command. Run it before removing the binary (e.g. `brew uninstall`), or Claude Code's status line goes blank. Install again after moving the binary (e.g. switching from a source build to Homebrew) so the status line points at the new path.
 

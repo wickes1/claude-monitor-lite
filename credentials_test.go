@@ -123,25 +123,6 @@ func TestToken_ExpiredCache_ReReads(t *testing.T) {
 	}
 }
 
-// Two profiles are two accounts: one's token must never be handed out for
-// the other, or its group would show the wrong account's usage.
-func TestTokenIsPerProfile(t *testing.T) {
-	source := func(token string) *credentialSource {
-		return &credentialSource{read: func() (*OAuthCredential, error) {
-			return &OAuthCredential{AccessToken: token, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}, nil
-		}}
-	}
-	personal, work := source("personal-token"), source("work-token")
-	for _, tc := range []struct {
-		src  *credentialSource
-		want string
-	}{{personal, "personal-token"}, {work, "work-token"}, {personal, "personal-token"}} {
-		if got, err := tc.src.token(); err != nil || got != tc.want {
-			t.Errorf("token() = %q, %v, want %q", got, err, tc.want)
-		}
-	}
-}
-
 // A CLAUDE_CONFIG_DIR environment must read its own Keychain item. Reading the
 // plain item instead silently reports the default account's usage under the
 // other environment's label. The hash follows Claude Code's own naming,

@@ -1,7 +1,7 @@
 package main
 
 /*
-#cgo CFLAGS: -x objective-c
+#cgo CFLAGS: -x objective-c -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa
 #include <stdlib.h>
 #import <Cocoa/Cocoa.h>
@@ -43,10 +43,15 @@ static void bringForward(NSWindow *window) {
 	[window makeKeyWindow];
 }
 
+// The About window while it is up. Main thread only.
+static NSWindow *aboutWindow = nil;
+
 // showAboutPanel shows the About window: the standard alert layout (icon,
 // name, one line on what the app does) over a grid of facts. rows holds one
 // "label\tvalue" per line; a value's own line breaks are vertical tabs.
 static void showAboutPanel(char *cTitle, char *cSummary, char *cRows, char *cRepoURL, char *cNotesURL) {
+	// Called on a Go thread, which has no autorelease pool of its own.
+	@autoreleasepool {
 	NSString *title = takeString(cTitle), *summary = takeString(cSummary), *rows = takeString(cRows);
 	NSString *repoURL = takeString(cRepoURL), *notesURL = takeString(cNotesURL);
 
@@ -55,11 +60,11 @@ static void showAboutPanel(char *cTitle, char *cSummary, char *cRows, char *cRep
 	// queued after it — the one below that brings the window forward, and
 	// anything else in the process — until the window is closed.
 	onMainRunLoop(^{
-		// A second click while the window is up brings it forward rather than
-		// stacking another modal session on the first.
-		static NSWindow *open = nil;
-		if (open != nil) {
-			bringForward(open);
+		// The menu's items are disabled while this modal window is up, so a
+		// second request should not arrive; if one does, it brings the window
+		// forward rather than stacking another modal session on the first.
+		if (aboutWindow != nil) {
+			bringForward(aboutWindow);
 			return;
 		}
 
@@ -100,18 +105,21 @@ static void showAboutPanel(char *cTitle, char *cSummary, char *cRows, char *cRep
 		[alert addButtonWithTitle:@"Release Notes"];
 
 		// Runs inside the modal session below, once it has put the window up.
-		open = alert.window;
+		aboutWindow = alert.window;
 		onMainRunLoop(^{
-			bringForward(open);
+			if (aboutWindow != nil) {
+				bringForward(aboutWindow);
+			}
 		});
 		NSModalResponse response = [alert runModal];
-		open = nil;
+		aboutWindow = nil;
 		NSString *url = response == NSAlertSecondButtonReturn ? repoURL
 			: response == NSAlertThirdButtonReturn ? notesURL : nil;
 		if (url != nil) {
 			[NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:url]];
 		}
 	});
+	}
 }
 */
 import "C"

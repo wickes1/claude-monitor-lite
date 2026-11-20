@@ -197,11 +197,17 @@ func (m *monitor) updateStats() time.Duration {
 	}
 	// Read on every poll rather than once: logging in to another account
 	// changes who the group should be named after.
-	account := m.profile.readAccount()
+	current := m.profile.readAccount()
 
 	displayMu.Lock()
 	recovered := m.failure != failNone
-	m.account, m.goodAt, m.failure = account, polledAt, failNone
+	// Claude Code rewrites that file while it runs; a read that catches it
+	// half-written must not rename the group after its folder until the next
+	// poll.
+	if current != (account{}) {
+		m.account = current
+	}
+	m.goodAt, m.failure = polledAt, failNone
 	displayMu.Unlock()
 	if recovered {
 		m.logf("Usage fetch recovered")
@@ -356,16 +362,18 @@ func (m *monitor) barTitle(head usageRow, ok bool) string {
 	return menuBarTitle(head, ok)
 }
 
-// headlineMonitor is the profile the menu bar shows a row of: the selected
-// one, or the first when the selection names a profile no longer watched.
-// Callers hold displayMu.
-func headlineMonitor() *monitor {
+// headline is what the menu bar shows: the selected profile — or the first
+// when the selection names one no longer watched — and its row. ok is false
+// when that profile has no row to show. Callers hold displayMu.
+func headline() (target *monitor, row usageRow, ok bool) {
+	target = monitors[0]
 	for _, m := range monitors {
 		if m.profile.dir == appConfig.MenuBarIndicator.Dir {
-			return m
+			target = m
 		}
 	}
-	return monitors[0]
+	row, _, ok = headlineRow(target.rows(), appConfig.MenuBarIndicator.Key)
+	return target, row, ok
 }
 
 // monitorLabels names each watched profile, in menu order. Callers hold
@@ -388,14 +396,9 @@ func render() {
 	grouped := len(monitors) > 1
 	labels := monitorLabels()
 
-	target := headlineMonitor()
-	var head usageRow
-	var ok bool
+	target, head, ok := headline()
 	for i, m := range monitors {
 		rows := m.rows()
-		if m == target {
-			head, _, ok = headlineRow(rows, appConfig.MenuBarIndicator.Key)
-		}
 
 		if title, show := headTitle(labels[i], m.statusText(now), grouped); show {
 			m.headItem.SetTitle(title)
@@ -428,8 +431,21 @@ func selectIndicator(ind Indicator) {
 	displayMu.Lock()
 	defer displayMu.Unlock()
 	appConfig.MenuBarIndicator = ind
-	if err := SaveConfig(appConfig); err != nil {
+	if err := saveIndicator(ind); err != nil {
 		log.Printf("Failed to save menu bar indicator: %v", err)
 	}
 	render()
+}
+
+// saveIndicator writes the selection into the config as it is on disk now,
+// not as this process read it at start: the profile list may have been
+// edited since, and saving the old copy over it would undo that. A file that
+// has become unusable is left alone.
+func saveIndicator(ind Indicator) error {
+	config, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	config.MenuBarIndicator = ind
+	return SaveConfig(config)
 }

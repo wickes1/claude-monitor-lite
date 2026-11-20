@@ -49,6 +49,15 @@ func TestWriteFileAtomic(t *testing.T) {
 	}
 }
 
+func mustLoad(t *testing.T) Config {
+	t.Helper()
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	return config
+}
+
 // A selection must survive a save/load round-trip — including a scoped row's
 // key, which carries a colon and a model name, and the profile it belongs to —
 // or a click would not stick.
@@ -62,22 +71,24 @@ func TestConfigRoundTripsSelection(t *testing.T) {
 		if err := SaveConfig(Config{Profiles: []string{"", work}, MenuBarIndicator: ind}); err != nil {
 			t.Fatalf("save %+v failed: %v", ind, err)
 		}
-		if got := LoadConfig().MenuBarIndicator; got != ind {
+		if got := mustLoad(t).MenuBarIndicator; got != ind {
 			t.Errorf("selection %+v not preserved, got %+v", ind, got)
 		}
 	}
 }
 
-// With nothing chosen — a missing or unreadable config — the monitor watches
-// the default environment and the menu bar follows the server's pick, so a
-// plan without a 5-hour limit does not start on "--".
+// With nothing chosen — no config, or one that says nothing — the monitor
+// watches the default environment and the menu bar follows the server's
+// pick, so a plan without a 5-hour limit does not start on "--". A selection
+// of a type this version does not read (a plain string, as written before
+// profiles existed) is nothing chosen, not a broken file.
 func TestLoadConfigDefaults(t *testing.T) {
 	home := withTempHome(t)
 	path := filepath.Join(home, ".claude-monitor-lite.json")
 
 	check := func(name string) {
 		t.Helper()
-		config := LoadConfig()
+		config := mustLoad(t)
 		if !slices.Equal(config.Profiles, []string{""}) {
 			t.Errorf("%s: profiles = %q, want the default environment alone", name, config.Profiles)
 		}
@@ -86,11 +97,38 @@ func TestLoadConfigDefaults(t *testing.T) {
 		}
 	}
 	check("missing config")
-	for _, body := range []string{`not json`, `{}`, `{"profiles":[]}`, `{"menuBarIndicator":{"key":""}}`} {
+	for _, body := range []string{`{}`, `{"profiles":[]}`, `{"menuBarIndicator":{"key":""}}`, `{"menuBarIndicator":"weekly_all"}`} {
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}
 		check("config " + body)
+	}
+}
+
+// The config is saved whole on every change. Loading a file the user broke
+// while editing it as "no profiles" would let the next click or add write
+// that over their list, so it must be refused instead — and a relative dir
+// too, which would mean a different place once the monitor runs from launchd.
+func TestLoadConfigRefusesUnusableFile(t *testing.T) {
+	home := withTempHome(t)
+	path := filepath.Join(home, ".claude-monitor-lite.json")
+	for _, body := range []string{
+		`not json`,
+		`{"profiles":["/Users/alice/.claude-work",]}`,
+		`{"profiles":["claude-work"]}`,
+	} {
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("config %s: loaded without error, want it refused", body)
+		}
+		if err := saveIndicator(Indicator{Key: kindSession}); err == nil {
+			t.Errorf("config %s: a click saved over it", body)
+		}
+		if got, _ := os.ReadFile(path); string(got) != body {
+			t.Errorf("config %s: file changed to %s", body, got)
+		}
 	}
 }
 
@@ -101,18 +139,72 @@ func TestLoadConfigDefaults(t *testing.T) {
 func TestLoadConfigProfiles(t *testing.T) {
 	home := withTempHome(t)
 	path := filepath.Join(home, ".claude-monitor-lite.json")
-	body := `{"profiles":["/Users/alice/.claude-work/","","/Users/alice/x/../.claude-work"],
+	body := `{"profiles":["/Users/alice/.claude-work/","","/Users/alice/x/../.claude-work","~/.claude-side"],
 		"menuBarIndicator":{"dir":"/Users/alice/.claude-gone","key":"session"}}`
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	config := LoadConfig()
-	if want := []string{"/Users/alice/.claude-work", ""}; !slices.Equal(config.Profiles, want) {
+	config := mustLoad(t)
+	if want := []string{"/Users/alice/.claude-work", "", filepath.Join(home, ".claude-side")}; !slices.Equal(config.Profiles, want) {
 		t.Errorf("profiles = %q, want %q", config.Profiles, want)
 	}
 	if want := (Indicator{Dir: "/Users/alice/.claude-work", Key: autoKey}); config.MenuBarIndicator != want {
 		t.Errorf("selection = %+v, want %+v", config.MenuBarIndicator, want)
+	}
+}
+
+// A click saves the selection into the file as it is now. The running
+// monitor read its config at start; writing that copy back would undo a
+// profile the user added to the file since.
+func TestSaveIndicatorKeepsProfilesOnDisk(t *testing.T) {
+	withTempHome(t)
+	const work = "/Users/alice/.claude-work"
+	if err := SaveConfig(Config{Profiles: []string{"", work}, MenuBarIndicator: Indicator{Key: autoKey}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveIndicator(Indicator{Dir: work, Key: kindWeeklyAll}); err != nil {
+		t.Fatal(err)
+	}
+	config := mustLoad(t)
+	if !slices.Equal(config.Profiles, []string{"", work}) {
+		t.Errorf("profiles = %q, want both kept", config.Profiles)
+	}
+	if want := (Indicator{Dir: work, Key: kindWeeklyAll}); config.MenuBarIndicator != want {
+		t.Errorf("selection = %+v, want %+v", config.MenuBarIndicator, want)
+	}
+}
+
+// add and remove edit the list the whole monitor runs on: a dir must not be
+// watched twice, the last profile must not be removable (the menu would be
+// empty), and removing the profile the menu bar shows must move the menu bar
+// to one that is still there.
+func TestWatchAndUnwatch(t *testing.T) {
+	const work = "/Users/alice/.claude-work"
+	config := Config{Profiles: []string{""}, MenuBarIndicator: Indicator{Key: autoKey}}
+
+	if err := config.unwatch(""); err != errOnlyProfile {
+		t.Errorf("unwatch the only profile: err = %v, want errOnlyProfile", err)
+	}
+	if !config.watch(work) || config.watch(work) {
+		t.Error("watch: want true the first time and false for a dir already watched")
+	}
+	if !slices.Equal(config.Profiles, []string{"", work}) {
+		t.Errorf("profiles = %q after watch", config.Profiles)
+	}
+	if err := config.unwatch("/Users/alice/.claude-other"); err != errNotWatched {
+		t.Errorf("unwatch an unknown dir: err = %v, want errNotWatched", err)
+	}
+
+	config.MenuBarIndicator = Indicator{Dir: work, Key: kindSession}
+	if err := config.unwatch(work); err != nil {
+		t.Fatalf("unwatch: %v", err)
+	}
+	if !slices.Equal(config.Profiles, []string{""}) {
+		t.Errorf("profiles = %q after unwatch", config.Profiles)
+	}
+	if want := (Indicator{Dir: "", Key: autoKey}); config.MenuBarIndicator != want {
+		t.Errorf("selection after removing its profile = %+v, want %+v", config.MenuBarIndicator, want)
 	}
 }
 

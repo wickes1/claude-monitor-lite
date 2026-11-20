@@ -185,7 +185,6 @@ func main() {
 	if _, err := os.UserHomeDir(); err != nil {
 		log.Fatal("Failed to get home directory:", err)
 	}
-	appConfig = LoadConfig()
 	pidFile = monitorFile(".pid")
 
 	if len(os.Args) > 1 {
@@ -247,6 +246,7 @@ func printUsage() {
 // as a menu bar that can only say "Login". With several profiles the monitor
 // still starts while at least one is logged in; the rest say so in the menu.
 func handleAutoStart() {
+	loadConfig()
 	if isRunning() {
 		handleStatusDisplay()
 		return
@@ -292,8 +292,9 @@ func handleStatusDisplay() {
 		}
 		var limits *UsageLimits
 		if err := json.Unmarshal(data, &limits); err != nil {
-			fmt.Fprintf(os.Stderr, "Unreadable usage cache %s: %v\n", path, err)
-			os.Exit(1)
+			// The other profiles' usage is still worth printing.
+			fmt.Fprintf(os.Stderr, "Unreadable usage cache %s: %v\n\n", path, err)
+			continue
 		}
 		if info, err := os.Stat(path); err == nil {
 			fmt.Printf("As of %s:\n", formatAsOf(info.ModTime(), time.Now()))
@@ -379,13 +380,30 @@ func profileArg(command string, args []string) profile {
 	return newProfile(args[0])
 }
 
+// loadConfig reads the config for the commands that need it, and stops on
+// one that cannot be used. The daemon has no terminal, so the reason goes to
+// the log as well.
+func loadConfig() {
+	config, err := LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		if f, ferr := openLogFile(); ferr == nil {
+			log.New(f, "", log.LstdFlags).Printf("Not started: %v", err)
+			f.Close()
+		}
+		os.Exit(1)
+	}
+	appConfig = config
+}
+
 // handleProfileAdd starts watching another Claude Code environment. It is
 // checked here, at the terminal: a mistyped dir or an environment nobody is
 // logged in to would otherwise only show as a group that never loads.
 func handleProfileAdd(args []string) {
 	p := profileArg("add", args)
+	loadConfig()
 	if slices.Contains(appConfig.Profiles, p.dir) {
-		fmt.Printf("✓ Already watching %s.\n", p.configDir())
+		fmt.Printf("✓ Already watching %s.\n", p)
 		return
 	}
 	if info, err := os.Stat(p.configDir()); err != nil || !info.IsDir() {
@@ -394,41 +412,45 @@ func handleProfileAdd(args []string) {
 	}
 	if _, err := p.readCredential(); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		if p.dir != "" {
+			fmt.Fprintf(os.Stderr, "  Log in there with: CLAUDE_CONFIG_DIR=%s claude   (then /login)\n", shellQuote(p.dir))
+		}
 		os.Exit(1)
 	}
 
-	appConfig.Profiles = append(appConfig.Profiles, p.dir)
+	appConfig.watch(p.dir)
 	saveProfiles()
-	fmt.Printf("✓ Watching %s.\n", p.configDir())
-	restartIfRunning()
+	fmt.Printf("✓ Watching %s.\n", p)
+	if stopForRestart() {
+		handleStart()
+	}
 }
 
 func handleProfileRemove(args []string) {
 	p := profileArg("remove", args)
-	idx := slices.Index(appConfig.Profiles, p.dir)
-	if idx < 0 {
-		fmt.Fprintf(os.Stderr, "❌ Not watching %s. Watched:\n", p.configDir())
+	loadConfig()
+	switch err := appConfig.unwatch(p.dir); err {
+	case errNotWatched:
+		fmt.Fprintf(os.Stderr, "❌ Not watching %s. Watched:\n", p)
 		for _, watched := range appConfig.profiles() {
-			fmt.Fprintf(os.Stderr, "  %s\n", watched.configDir())
+			fmt.Fprintf(os.Stderr, "  %s\n", watched)
 		}
 		os.Exit(1)
-	}
-	if len(appConfig.Profiles) == 1 {
+	case errOnlyProfile:
 		fmt.Fprintln(os.Stderr, "❌ It is the only environment watched. Add another first, or stop the monitor.")
 		os.Exit(1)
 	}
 
-	appConfig.Profiles = slices.Delete(appConfig.Profiles, idx, idx+1)
-	if appConfig.MenuBarIndicator.Dir == p.dir {
-		appConfig.MenuBarIndicator = Indicator{Dir: appConfig.Profiles[0], Key: autoKey}
-	}
+	// Stopped before its files change: a running monitor would write the
+	// profile's usage cache back.
+	restart := stopForRestart()
 	saveProfiles()
 	// The cache would otherwise be printed by a later add as that profile's
 	// current usage.
 	if err := os.Remove(p.file(".usage.json")); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to remove %s: %v\n", p.file(".usage.json"), err)
 	}
-	fmt.Printf("✓ No longer watching %s.\n", p.configDir())
+	fmt.Printf("✓ No longer watching %s.\n", p)
 	if _, err := os.Stat(statusLineWrapFile(p)); err == nil {
 		fmt.Println("  Its status line still feeds the monitor. Restore it with:")
 		if p.dir == "" {
@@ -437,7 +459,9 @@ func handleProfileRemove(args []string) {
 			fmt.Printf("    CLAUDE_CONFIG_DIR=%s claude-monitor-lite statusline uninstall\n", shellQuote(p.dir))
 		}
 	}
-	restartIfRunning()
+	if restart {
+		handleStart()
+	}
 }
 
 func saveProfiles() {
@@ -447,17 +471,16 @@ func saveProfiles() {
 	}
 }
 
-// restartIfRunning restarts a running monitor so it picks up the profiles
-// just saved: its menu is built once, at start.
-func restartIfRunning() {
+// stopForRestart stops a running monitor and reports whether there was one,
+// for the caller to start again once the profiles are saved: the menu is
+// built once, at start.
+func stopForRestart() bool {
 	pid, err := stopRunning()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to stop the running monitor (restart it yourself to apply): %v\n", err)
 		os.Exit(1)
 	}
-	if pid != 0 {
-		handleStart()
-	}
+	return pid != 0
 }
 
 // stopRunning stops the running monitor and returns its PID, or 0 when

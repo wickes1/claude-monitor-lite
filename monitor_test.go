@@ -73,8 +73,7 @@ func TestMenuBarFollowsSelectedProfileOnly(t *testing.T) {
 	monitors = []*monitor{personal, idle}
 
 	bar := func() string {
-		target := headlineMonitor()
-		head, _, ok := headlineRow(target.rows(), appConfig.MenuBarIndicator.Key)
+		target, head, ok := headline()
 		return target.barTitle(head, ok)
 	}
 
@@ -92,7 +91,7 @@ func TestMenuBarFollowsSelectedProfileOnly(t *testing.T) {
 
 	// A selection left pointing at a profile that is gone falls back to the first.
 	appConfig.MenuBarIndicator = Indicator{Dir: "/Users/alice/.claude-gone", Key: autoKey}
-	if got := headlineMonitor(); got != personal {
+	if got, _, _ := headline(); got != personal {
 		t.Errorf("unknown profile selected: headline is %+v, want the first profile", got.profile)
 	}
 }

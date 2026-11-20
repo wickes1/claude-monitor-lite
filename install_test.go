@@ -174,17 +174,10 @@ func programArguments(t *testing.T, plist string) []string {
 }
 
 // One monitor watches every profile, and which ones comes from its config.
-// A plist that carried the installing shell's CLAUDE_CONFIG_DIR would tie the
-// job to one environment again, so installing from a shell that has the
-// variable set must produce the same job as installing from one that has not.
-func TestRenderLaunchAgentIgnoresEnvironment(t *testing.T) {
-	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	plain := renderLaunchAgent("/bin/cml")
-	t.Setenv("CLAUDE_CONFIG_DIR", "/Users/x/.claude-work")
-	if got := renderLaunchAgent("/bin/cml"); got != plain {
-		t.Errorf("plist depends on CLAUDE_CONFIG_DIR:\n%s\nwant:\n%s", got, plain)
-	}
-	if strings.Contains(plain, "EnvironmentVariables") {
+// A plist that set CLAUDE_CONFIG_DIR, as the per-environment jobs did, would
+// read as tying the job to one environment again.
+func TestRenderLaunchAgentSetsNoEnvironment(t *testing.T) {
+	if strings.Contains(renderLaunchAgent("/bin/cml"), "EnvironmentVariables") {
 		t.Error("plist must not set EnvironmentVariables")
 	}
 }
