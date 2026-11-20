@@ -28,6 +28,21 @@ static NSTextField *aboutValue(NSString *text) {
 	return field;
 }
 
+static void onMainRunLoop(void (^block)(void)) {
+	CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, block);
+	CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+// bringForward puts the window above the other apps' windows. A menu bar
+// app is not the active app when its menu is used, and asking to be activated
+// is not always granted, so without ordering the window front itself it opens
+// behind whatever the user is working in — a modal window nobody can see.
+static void bringForward(NSWindow *window) {
+	[NSApp activateIgnoringOtherApps:YES];
+	[window orderFrontRegardless];
+	[window makeKeyWindow];
+}
+
 // showAboutPanel shows the About window: the standard alert layout (icon,
 // name, one line on what the app does) over a grid of facts. rows holds one
 // "label\tvalue" per line; a value's own line breaks are vertical tabs.
@@ -35,15 +50,18 @@ static void showAboutPanel(char *cTitle, char *cSummary, char *cRows, char *cRep
 	NSString *title = takeString(cTitle), *summary = takeString(cSummary), *rows = takeString(cRows);
 	NSString *repoURL = takeString(cRepoURL), *notesURL = takeString(cNotesURL);
 
-	dispatch_async(dispatch_get_main_queue(), ^{
+	// Run from the run loop rather than the main dispatch queue: that queue is
+	// serial, so a block that sits in a modal session holds up every block
+	// queued after it — the one below that brings the window forward, and
+	// anything else in the process — until the window is closed.
+	onMainRunLoop(^{
 		// A second click while the window is up brings it forward rather than
 		// stacking another modal session on the first.
-		static BOOL open = NO;
-		[NSApp activateIgnoringOtherApps:YES];
-		if (open) {
+		static NSWindow *open = nil;
+		if (open != nil) {
+			bringForward(open);
 			return;
 		}
-		open = YES;
 
 		NSAlert *alert = [[NSAlert alloc] init];
 		alert.messageText = title;
@@ -81,8 +99,13 @@ static void showAboutPanel(char *cTitle, char *cSummary, char *cRows, char *cRep
 		[alert addButtonWithTitle:@"View on GitHub"];
 		[alert addButtonWithTitle:@"Release Notes"];
 
+		// Runs inside the modal session below, once it has put the window up.
+		open = alert.window;
+		onMainRunLoop(^{
+			bringForward(open);
+		});
 		NSModalResponse response = [alert runModal];
-		open = NO;
+		open = nil;
 		NSString *url = response == NSAlertSecondButtonReturn ? repoURL
 			: response == NSAlertThirdButtonReturn ? notesURL : nil;
 		if (url != nil) {
