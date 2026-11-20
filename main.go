@@ -35,7 +35,7 @@ const (
 // version is set via ldflags at build time (e.g., -X main.version=v1.0.0)
 var version = "dev"
 
-// githubURL is the project repository, shown in (and opened from) the About dialog.
+// githubURL is the project repository, opened from the About window.
 const githubURL = "https://github.com/wickes1/claude-monitor-lite"
 
 var (
@@ -588,7 +588,7 @@ func onReady() {
 	systray.AddSeparator()
 
 	mRefresh := systray.AddMenuItem("Refresh Now", "Refresh usage data")
-	mAbout := systray.AddMenuItem("About", "Show version info")
+	mAbout := systray.AddMenuItem("About", "Version, accounts and how the monitor works")
 	systray.AddSeparator()
 
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
@@ -635,20 +635,10 @@ func onReady() {
 					m.requestRefresh()
 				}
 			case <-mAbout.ClickedCh:
-				go showAboutDialog()
+				showAbout()
 			}
 		}
 	}()
-}
-
-// showAboutDialog shows a version dialog with a button that opens the project
-// on GitHub.
-func showAboutDialog() {
-	script := fmt.Sprintf(`display dialog "Claude Monitor Lite\nVersion: %s" buttons {"View on GitHub", "OK"} default button "OK" with title "About"
-if button returned of result is "View on GitHub" then open location "%s"`, version, githubURL)
-	if err := exec.Command("osascript", "-e", script).Start(); err != nil {
-		log.Printf("Failed to show about dialog: %v", err)
-	}
 }
 
 // maxTransientErrors is the number of consecutive transient failures tolerated

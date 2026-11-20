@@ -368,6 +368,17 @@ func headlineMonitor() *monitor {
 	return monitors[0]
 }
 
+// monitorLabels names each watched profile, in menu order. Callers hold
+// displayMu.
+func monitorLabels() []string {
+	profiles := make([]profile, len(monitors))
+	accounts := make([]account, len(monitors))
+	for i, m := range monitors {
+		profiles[i], accounts[i] = m.profile, m.account
+	}
+	return profileLabels(profiles, accounts)
+}
+
 // render redraws every group, the checkmark and the menu bar title. The
 // checkmark sits on the row the menu bar shows, pinned or not: with several
 // groups and no name in the menu bar, it is what says whose number that is.
@@ -375,12 +386,7 @@ func headlineMonitor() *monitor {
 func render() {
 	now := time.Now()
 	grouped := len(monitors) > 1
-	profiles := make([]profile, len(monitors))
-	accounts := make([]account, len(monitors))
-	for i, m := range monitors {
-		profiles[i], accounts[i] = m.profile, m.account
-	}
-	labels := profileLabels(profiles, accounts)
+	labels := monitorLabels()
 
 	target := headlineMonitor()
 	var head usageRow
