@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -437,5 +438,79 @@ func TestRunStatusLineGuardStopsRecursion(t *testing.T) {
 	runStatusLine()
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("top-level run did not execute the wrapped command")
+	}
+}
+
+// The status line can only be fed where Claude Code has been set up. In an
+// environment whose directory does not exist — Claude Code never ran, or
+// CLAUDE_CONFIG_DIR is mistyped — install must say so and leave nothing
+// behind: a leftover wrap file reads to `uninstall` and to the About window
+// as an installed feed.
+func TestInstallStatusLineNeedsTheConfigDir(t *testing.T) {
+	home := withTempHome(t)
+	for _, p := range []profile{newProfile(""), newProfile(filepath.Join(home, ".claude-typo"))} {
+		_, _, _, err := installStatusLine(p, "'/bin/cml' statusline")
+		if err == nil || !strings.Contains(err.Error(), p.configDir()) {
+			t.Errorf("%s: err = %v, want one naming the missing directory", p, err)
+		}
+		if _, err := os.Stat(statusLineWrapFile(p)); !os.IsNotExist(err) {
+			t.Errorf("%s: wrap file left behind after a failed install", p)
+		}
+		if isDir(p.configDir()) {
+			t.Errorf("%s: install created the directory", p)
+		}
+	}
+}
+
+// An install that cannot write settings.json did not happen, so it must take
+// back the wrap file it wrote first.
+func TestInstallStatusLineLeavesNothingWhenItFails(t *testing.T) {
+	home := withTempHome(t)
+	dir := filepath.Join(home, ".claude")
+	if err := os.Mkdir(dir, 0500); err != nil { // no write permission: settings.json cannot be created
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0700) })
+
+	p := newProfile("")
+	if _, _, _, err := installStatusLine(p, "'/bin/cml' statusline"); err == nil {
+		t.Fatal("install into a read-only directory reported success")
+	}
+	if _, err := os.Stat(statusLineWrapFile(p)); !os.IsNotExist(err) {
+		t.Error("wrap file left behind after a failed install")
+	}
+}
+
+// The whole install as it touches disk: the user's command is kept for the
+// wrapper to run, settings.json is backed up once, and a second install
+// changes nothing — it must not overwrite the kept command with our own.
+func TestInstallStatusLineOnDisk(t *testing.T) {
+	home := withTempHome(t)
+	dir := filepath.Join(home, ".claude")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(dir, "settings.json")
+	const before = `{"model":"x","statusLine":{"type":"command","command":"my-line --fast"}}`
+	if err := os.WriteFile(settings, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := newProfile("")
+	const feed = "'/bin/claude-monitor-lite' statusline"
+
+	for i, wantAlready := range []bool{false, true} {
+		_, _, already, err := installStatusLine(p, feed)
+		if err != nil || already != wantAlready {
+			t.Fatalf("install %d: already = %v, err = %v, want already = %v", i+1, already, err, wantAlready)
+		}
+		if wrapped, _ := readStatusLineWrap(p); wrapped != "my-line --fast" {
+			t.Errorf("install %d: kept command = %q, want the user's", i+1, wrapped)
+		}
+		if got, _ := os.ReadFile(settings); !strings.Contains(string(got), "claude-monitor-lite' statusline") || !strings.Contains(string(got), `"model"`) {
+			t.Errorf("install %d: settings.json = %s", i+1, got)
+		}
+		if backup, _ := os.ReadFile(settings + ".claude-monitor-lite.bak"); string(backup) != before {
+			t.Errorf("install %d: backup = %s, want the file as it was", i+1, backup)
+		}
 	}
 }

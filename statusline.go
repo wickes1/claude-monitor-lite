@@ -675,47 +675,9 @@ func currentFeedCommand(p profile) string {
 // like Claude Code itself: set CLAUDE_CONFIG_DIR to wire up another profile.
 func handleStatusLineInstall() {
 	p := envProfile()
-	feed := currentFeedCommand(p)
-
-	path := claudeSettingsPath(p)
-	settings, perm, err := readSettings(path)
+	path, original, already, err := installStatusLine(p, currentFeedCommand(p))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", path, err)
-		os.Exit(1)
-	}
-	out, original, already, err := installStatusLineSettings(settings, feed)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to update %s: %v\n", path, err)
-		os.Exit(1)
-	}
-
-	if already {
-		// The wrap file from the first install still holds the original;
-		// without it the wrapper would silently drop the user's status line.
-		if _, err := readStatusLineWrap(p); err != nil {
-			fmt.Fprintf(os.Stderr, "Status line already points at claude-monitor-lite, but %s is unreadable (%v).\n", statusLineWrapFile(p), err)
-			fmt.Fprintln(os.Stderr, "Set statusLine.command in settings.json back to your own command, then install again.")
-			os.Exit(1)
-		}
-	} else {
-		// Record the original before touching settings.json, so a failure
-		// here leaves Claude Code exactly as it was.
-		if err := writeFileAtomic(statusLineWrapFile(p), []byte(original), configFilePermissions); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to save the original status line: %v\n", err)
-			os.Exit(1)
-		}
-		// Keep the first backup: a later one may already hold our command.
-		backup := path + ".claude-monitor-lite.bak"
-		if _, err := os.Stat(backup); settings != nil && os.IsNotExist(err) {
-			if err := writeFileAtomic(backup, settings, perm); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to back up %s: %v\n", path, err)
-				os.Exit(1)
-			}
-		}
-	}
-
-	if err := writeFileAtomic(path, out, perm); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write %s: %v\n", path, err)
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
 	}
 
@@ -730,6 +692,67 @@ func handleStatusLineInstall() {
 	}
 	fmt.Println("  Takes effect on Claude Code's next status line render.")
 	fmt.Println("  Remove with: claude-monitor-lite statusline uninstall")
+}
+
+// installStatusLine points the profile's status line at feed and returns the
+// settings file it changed, the command that was there before, and whether
+// the feed was installed already. On an error it leaves nothing of its own
+// behind: a wrap file from an install that did not happen would make
+// `statusline uninstall` and the About window report live updates that are
+// not there.
+func installStatusLine(p profile, feed string) (path, original string, already bool, err error) {
+	path = claudeSettingsPath(p)
+	// Claude Code creates this directory on its first run. Without it there
+	// is no status line to feed, and creating it here would turn a mistyped
+	// CLAUDE_CONFIG_DIR into a stray directory.
+	if dir := filepath.Dir(path); !isDir(dir) {
+		return path, "", false, fmt.Errorf("%s does not exist: Claude Code has not run in this environment yet. Run it once (and check CLAUDE_CONFIG_DIR, if you set it), then install again", dir)
+	}
+	settings, perm, err := readSettings(path)
+	if err != nil {
+		return path, "", false, fmt.Errorf("failed to read %s: %w", path, err)
+	}
+	out, original, already, err := installStatusLineSettings(settings, feed)
+	if err != nil {
+		return path, "", false, fmt.Errorf("failed to update %s: %w", path, err)
+	}
+
+	if already {
+		// The wrap file from the first install still holds the original;
+		// without it the wrapper would silently drop the user's status line.
+		if _, err := readStatusLineWrap(p); err != nil {
+			return path, "", true, fmt.Errorf("status line already points at claude-monitor-lite, but %s is unreadable (%v).\nSet statusLine.command in settings.json back to your own command, then install again", statusLineWrapFile(p), err)
+		}
+	} else {
+		// Record the original before touching settings.json, so a failure
+		// here leaves Claude Code exactly as it was.
+		if err := writeFileAtomic(statusLineWrapFile(p), []byte(original), configFilePermissions); err != nil {
+			return path, original, false, fmt.Errorf("failed to save the original status line: %w", err)
+		}
+		// Keep the first backup: a later one may already hold our command.
+		backup := path + ".claude-monitor-lite.bak"
+		if _, err := os.Stat(backup); settings != nil && os.IsNotExist(err) {
+			if err := writeFileAtomic(backup, settings, perm); err != nil {
+				os.Remove(statusLineWrapFile(p))
+				return path, original, false, fmt.Errorf("failed to back up %s: %w", path, err)
+			}
+		}
+	}
+
+	if err := writeFileAtomic(path, out, perm); err != nil {
+		if !already {
+			// settings.json still holds the original command, so the copy
+			// in the wrap file is not needed.
+			os.Remove(statusLineWrapFile(p))
+		}
+		return path, original, already, fmt.Errorf("failed to write %s: %w", path, err)
+	}
+	return path, original, already, nil
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func handleStatusLineUninstall() {
