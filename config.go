@@ -4,72 +4,76 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
+	"slices"
 )
 
 const configFilePermissions = 0600 // Owner read/write only
 
-// Config is the monitor's own settings — only which metric the menu bar shows:
-// a row key (rows.go), or autoKey to follow the server's pick. Credentials are
-// never stored here (see credentials.go).
+// Config is the monitor's own settings: which Claude Code environments it
+// watches and which metric the menu bar shows. Credentials are never stored
+// here (see credentials.go).
 type Config struct {
-	MenuBarIndicator string `json:"menuBarIndicator"`
+	// Profiles lists the config dirs to watch, in menu order. An empty string
+	// is the default environment (profile.go).
+	Profiles         []string  `json:"profiles"`
+	MenuBarIndicator Indicator `json:"menuBarIndicator"`
 }
 
-var unsafeInstanceChars = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
-
-// instanceName is the readable name of the Claude Code environment this monitor
-// watches — the CLAUDE_CONFIG_DIR folder name, shown in the menu bar. Empty for
-// the default ~/.claude environment.
-func instanceName() string {
-	if os.Getenv("CLAUDE_CONFIG_DIR") == "" {
-		return ""
-	}
-	name := unsafeInstanceChars.ReplaceAllString(filepath.Base(absConfigDir()), "-")
-	if name = strings.Trim(name, "-"); name == "" {
-		return "custom"
-	}
-	return name
+// Indicator picks the row the menu bar shows: a row key (rows.go) of the
+// profile at Dir, or autoKey to follow the server's pick for that profile.
+// It starts as autoKey on the first profile and stays there until a row is
+// clicked: which rows a plan has is not known before its usage arrives, so
+// no row could be the default.
+type Indicator struct {
+	Dir string `json:"dir"`
+	Key string `json:"key"`
 }
 
-// instanceID makes the name unique per environment, so one monitor per
-// CLAUDE_CONFIG_DIR can run side by side without sharing a PID file, config,
-// log, or LaunchAgent — even when two dirs share a folder name.
-func instanceID() string {
-	if name := instanceName(); name != "" {
-		return name + "-" + configDirHash()
+// profiles returns the watched profiles in menu order.
+func (c Config) profiles() []profile {
+	profiles := make([]profile, len(c.Profiles))
+	for i, dir := range c.Profiles {
+		profiles[i] = newProfile(dir)
 	}
-	return ""
+	return profiles
 }
 
-// instanceFile returns this instance's dotfile in the home directory:
-// ~/.claude-monitor-lite<ext> by default, ~/.claude-monitor-lite.<id><ext>
-// for a CLAUDE_CONFIG_DIR instance.
-func instanceFile(ext string) string {
+// monitorFile returns one of the monitor's own dotfiles in the home
+// directory, ~/.claude-monitor-lite<ext>: the config, the PID file and the
+// log, of which there is one however many profiles are watched.
+func monitorFile(ext string) string {
 	homeDir, _ := os.UserHomeDir()
-	base := ".claude-monitor-lite"
-	if id := instanceID(); id != "" {
-		base += "." + id
-	}
-	return filepath.Join(homeDir, base+ext)
+	return filepath.Join(homeDir, ".claude-monitor-lite"+ext)
 }
 
 func GetConfigPath() string {
-	return instanceFile(".json")
+	return monitorFile(".json")
 }
 
-// LoadConfig reads the config, falling back to following the server's pick
-// when the file is missing, unreadable, or names no row. A key is not checked
-// against the rows here: which rows exist is only known once usage arrives,
-// and headlineRow handles a pinned row the account does not have.
+// LoadConfig reads the config. A missing or unreadable file, or one that
+// names no profile, watches the default environment; a missing or unknown
+// selection follows the server's pick for the first profile. A row key is not
+// checked against the rows here: which rows exist is only known once usage
+// arrives, and headlineRow handles a pinned row the account does not have.
 func LoadConfig() Config {
 	var config Config
 	if data, err := os.ReadFile(GetConfigPath()); err == nil {
 		_ = json.Unmarshal(data, &config)
 	}
-	if config.MenuBarIndicator == "" {
-		config.MenuBarIndicator = autoKey
+	// One group per environment: the same dir listed twice would poll one
+	// account twice and show it twice.
+	var dirs []string
+	for _, p := range config.profiles() {
+		if !slices.Contains(dirs, p.dir) {
+			dirs = append(dirs, p.dir)
+		}
+	}
+	if len(dirs) == 0 {
+		dirs = []string{""}
+	}
+	config.Profiles = dirs
+	if config.MenuBarIndicator.Key == "" || !slices.Contains(dirs, config.MenuBarIndicator.Dir) {
+		config.MenuBarIndicator = Indicator{Dir: dirs[0], Key: autoKey}
 	}
 	return config
 }

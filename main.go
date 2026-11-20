@@ -10,9 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -39,49 +39,20 @@ var version = "dev"
 const githubURL = "https://github.com/wickes1/claude-monitor-lite"
 
 var (
-	// rowMenuItems is a fixed pool of menu items for the usage rows; item i
-	// shows row i and the rest stay hidden. A pool because the rows are only
-	// known once usage arrives, while systray can only append items — a row
-	// added later would land below Quit. Populated once in onReady.
-	rowMenuItems []*systray.MenuItem
-	// autoMenuItem returns the menu bar to the server's pick.
-	autoMenuItem *systray.MenuItem
-	// statusMenuItem says why there are no numbers: loading, not logged in,
-	// a failing fetch, a plan without limits. Hidden otherwise.
-	statusMenuItem *systray.MenuItem
-
-	appConfig    Config
-	pidFile      string
-	claudeClient *ClaudeUsageClient
-
-	// Guards appConfig — written by menu clicks, read by the update worker.
-	indicatorMutex sync.RWMutex
-
-	// Last fetched limits, for instant display switching. Guarded by limitsMutex.
-	lastLimits  *UsageLimits
-	limitsMutex sync.RWMutex
-
-	// Consecutive error tracking for transient error resilience. Both counters
-	// are guarded by consecutiveMutex.
-	consecutiveErrors     int
-	consecutiveRateLimits int
-	consecutiveMutex      sync.Mutex
+	// appConfig is written by menu clicks and read by the update workers;
+	// once the menu is up it is guarded by displayMu (monitor.go).
+	appConfig Config
+	pidFile   string
 
 	// Context for graceful shutdown
 	appCtx    context.Context
 	appCancel context.CancelFunc
 )
 
-// maxMenuRows is the size of the row pool. Accounts observed so far report
-// three or four rows; rows past the pool are left off the menu but still
-// printed by the status command.
+// maxMenuRows is the size of each profile's row pool. Accounts observed so
+// far report three or four rows; rows past the pool are left off the menu but
+// still printed by the status command.
 const maxMenuRows = 12
-
-func getMenuBarIndicator() string {
-	indicatorMutex.RLock()
-	defer indicatorMutex.RUnlock()
-	return appConfig.MenuBarIndicator
-}
 
 // Helper function to round utilization to nearest integer
 func roundUtilization(utilization float64) int {
@@ -182,8 +153,8 @@ func formatRow(row usageRow, console bool) string {
 
 // displayUsageStats prints every usage row, including any the menu's row pool
 // has no room for.
-func displayUsageStats(limits *UsageLimits) {
-	fmt.Println("=== Current Usage ===")
+func displayUsageStats(title string, limits *UsageLimits) {
+	fmt.Printf("=== %s ===\n", title)
 	rows := usageRows(limits)
 	for _, row := range rows {
 		fmt.Println(formatRow(row, true))
@@ -192,19 +163,6 @@ func displayUsageStats(limits *UsageLimits) {
 		fmt.Println(noLimitsMessage)
 	}
 	fmt.Println()
-}
-
-// noLimitsMessage is shown when a usage response lists no meter at all — a
-// seat billed by usage, with no plan limits to count against.
-const noLimitsMessage = "No usage limits reported for this plan"
-
-// setMenuBarTitle prefixes the title with the instance name so side-by-side
-// monitors (one per CLAUDE_CONFIG_DIR) are told apart at a glance.
-func setMenuBarTitle(title string) {
-	if name := instanceName(); name != "" {
-		title = name + " " + title
-	}
-	systray.SetTitle(title)
 }
 
 // menuBarTitle is the menu bar text for the headline row; ok is false when
@@ -228,7 +186,7 @@ func main() {
 		log.Fatal("Failed to get home directory:", err)
 	}
 	appConfig = LoadConfig()
-	pidFile = instanceFile(".pid")
+	pidFile = monitorFile(".pid")
 
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -240,6 +198,10 @@ func main() {
 			handleInstall()
 		case "uninstall":
 			handleUninstall()
+		case "add":
+			handleProfileAdd(os.Args[2:])
+		case "remove":
+			handleProfileRemove(os.Args[2:])
 		case "statusline":
 			handleStatusLine(os.Args[2:])
 		case "version", "--version", "-v":
@@ -267,6 +229,8 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite              Start monitor (show status if running)")
 	fmt.Println("  claude-monitor-lite start        Same as above")
 	fmt.Println("  claude-monitor-lite stop         Stop the monitor")
+	fmt.Println("  claude-monitor-lite add <dir>    Also watch the Claude Code environment in <dir>")
+	fmt.Println("  claude-monitor-lite remove <dir> Stop watching it (\"default\" names ~/.claude)")
 	fmt.Println("  claude-monitor-lite install      Start automatically at login (LaunchAgent)")
 	fmt.Println("  claude-monitor-lite uninstall    Stop starting automatically at login")
 	fmt.Println("  claude-monitor-lite statusline install    Live usage from Claude Code's status line")
@@ -274,19 +238,28 @@ func printUsage() {
 	fmt.Println("  claude-monitor-lite version      Show version")
 	fmt.Println("  claude-monitor-lite help         Show this help")
 	fmt.Println()
-	fmt.Println("Reads your Claude Code login; set CLAUDE_CONFIG_DIR to watch another environment.")
+	fmt.Println("Reads your Claude Code login. <dir> is another environment's CLAUDE_CONFIG_DIR;")
+	fmt.Println("each watched environment is a group in the menu, named after its account.")
 }
 
 // handleAutoStart shows status if the monitor is running, otherwise starts it.
 // A missing Claude Code login is reported here, at the terminal, rather than
-// as a menu bar that can only say "Login".
+// as a menu bar that can only say "Login". With several profiles the monitor
+// still starts while at least one is logged in; the rest say so in the menu.
 func handleAutoStart() {
 	if isRunning() {
 		handleStatusDisplay()
 		return
 	}
-	if _, err := readCredential(); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+	loggedIn := false
+	for _, p := range appConfig.profiles() {
+		if _, err := p.readCredential(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		} else {
+			loggedIn = true
+		}
+	}
+	if !loggedIn {
 		os.Exit(1)
 	}
 	fmt.Println("⚙️  Starting Claude Monitor Lite...")
@@ -298,35 +271,57 @@ func handleStatusDisplay() {
 	fmt.Printf("✓ Already running (PID: %d)\n", pid)
 	fmt.Println()
 
-	path := instanceFile(".usage.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Println("No usage fetched yet — check the menu bar in a moment.")
-		return
+	profiles := appConfig.profiles()
+	accounts := make([]account, len(profiles))
+	for i, p := range profiles {
+		accounts[i] = p.readAccount()
 	}
-	var limits *UsageLimits
-	if err := json.Unmarshal(data, &limits); err != nil {
-		fmt.Fprintf(os.Stderr, "Unreadable usage cache %s: %v\n", path, err)
-		os.Exit(1)
-	}
-	if info, err := os.Stat(path); err == nil {
-		fmt.Printf("As of %s:\n", info.ModTime().Format("15:04"))
-	}
+	labels := profileLabels(profiles, accounts)
 
-	displayUsageStats(limits)
+	var shows string
+	for i, p := range profiles {
+		title := "Current Usage"
+		if len(profiles) > 1 {
+			title = labels[i]
+		}
+		path := p.file(".usage.json")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Printf("=== %s ===\nNo usage fetched yet — check the menu bar in a moment.\n\n", title)
+			continue
+		}
+		var limits *UsageLimits
+		if err := json.Unmarshal(data, &limits); err != nil {
+			fmt.Fprintf(os.Stderr, "Unreadable usage cache %s: %v\n", path, err)
+			os.Exit(1)
+		}
+		if info, err := os.Stat(path); err == nil {
+			fmt.Printf("As of %s:\n", formatAsOf(info.ModTime(), time.Now()))
+		}
+		displayUsageStats(title, limits)
 
-	row, auto, ok := headlineRow(usageRows(limits), getMenuBarIndicator())
-	if !ok {
-		return
+		if p.dir != appConfig.MenuBarIndicator.Dir {
+			continue
+		}
+		row, auto, ok := headlineRow(usageRows(limits), appConfig.MenuBarIndicator.Key)
+		if !ok {
+			continue
+		}
+		value := "--"
+		if row.limit != nil {
+			value = fmt.Sprintf("%s %d%%", getColorIndicator(row.limit.Utilization), roundUtilization(row.limit.Utilization))
+		}
+		if auto {
+			value += ", Claude's pick"
+		}
+		shows = fmt.Sprintf("%s (%s)", row.label, value)
+		if len(profiles) > 1 {
+			shows = labels[i] + " — " + shows
+		}
 	}
-	value := "--"
-	if row.limit != nil {
-		value = fmt.Sprintf("%s %d%%", getColorIndicator(row.limit.Utilization), roundUtilization(row.limit.Utilization))
+	if shows != "" {
+		fmt.Printf("Menu Bar Shows:  %s\n", shows)
 	}
-	if auto {
-		value += ", Claude's pick"
-	}
-	fmt.Printf("Menu Bar Shows:  %s (%s)\n", row.label, value)
 }
 
 func handleStart() {
@@ -371,7 +366,101 @@ func handleStop() {
 	}
 }
 
-// stopRunning stops this instance's monitor and returns its PID, or 0 when
+// profileArg reads the one argument of add and remove: a config dir, or
+// defaultProfileName for the default environment.
+func profileArg(command string, args []string) profile {
+	if len(args) != 1 || args[0] == "" {
+		fmt.Fprintf(os.Stderr, "Usage: claude-monitor-lite %s <dir>   (%q names the default environment, ~/.claude)\n", command, defaultProfileName)
+		os.Exit(1)
+	}
+	if args[0] == defaultProfileName {
+		return profile{}
+	}
+	return newProfile(args[0])
+}
+
+// handleProfileAdd starts watching another Claude Code environment. It is
+// checked here, at the terminal: a mistyped dir or an environment nobody is
+// logged in to would otherwise only show as a group that never loads.
+func handleProfileAdd(args []string) {
+	p := profileArg("add", args)
+	if slices.Contains(appConfig.Profiles, p.dir) {
+		fmt.Printf("✓ Already watching %s.\n", p.configDir())
+		return
+	}
+	if info, err := os.Stat(p.configDir()); err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "❌ %s is not a directory. Give the environment's CLAUDE_CONFIG_DIR.\n", p.configDir())
+		os.Exit(1)
+	}
+	if _, err := p.readCredential(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+
+	appConfig.Profiles = append(appConfig.Profiles, p.dir)
+	saveProfiles()
+	fmt.Printf("✓ Watching %s.\n", p.configDir())
+	restartIfRunning()
+}
+
+func handleProfileRemove(args []string) {
+	p := profileArg("remove", args)
+	idx := slices.Index(appConfig.Profiles, p.dir)
+	if idx < 0 {
+		fmt.Fprintf(os.Stderr, "❌ Not watching %s. Watched:\n", p.configDir())
+		for _, watched := range appConfig.profiles() {
+			fmt.Fprintf(os.Stderr, "  %s\n", watched.configDir())
+		}
+		os.Exit(1)
+	}
+	if len(appConfig.Profiles) == 1 {
+		fmt.Fprintln(os.Stderr, "❌ It is the only environment watched. Add another first, or stop the monitor.")
+		os.Exit(1)
+	}
+
+	appConfig.Profiles = slices.Delete(appConfig.Profiles, idx, idx+1)
+	if appConfig.MenuBarIndicator.Dir == p.dir {
+		appConfig.MenuBarIndicator = Indicator{Dir: appConfig.Profiles[0], Key: autoKey}
+	}
+	saveProfiles()
+	// The cache would otherwise be printed by a later add as that profile's
+	// current usage.
+	if err := os.Remove(p.file(".usage.json")); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: failed to remove %s: %v\n", p.file(".usage.json"), err)
+	}
+	fmt.Printf("✓ No longer watching %s.\n", p.configDir())
+	if _, err := os.Stat(statusLineWrapFile(p)); err == nil {
+		fmt.Println("  Its status line still feeds the monitor. Restore it with:")
+		if p.dir == "" {
+			fmt.Println("    claude-monitor-lite statusline uninstall")
+		} else {
+			fmt.Printf("    CLAUDE_CONFIG_DIR=%s claude-monitor-lite statusline uninstall\n", shellQuote(p.dir))
+		}
+	}
+	restartIfRunning()
+}
+
+func saveProfiles() {
+	if err := SaveConfig(appConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to save %s: %v\n", GetConfigPath(), err)
+		os.Exit(1)
+	}
+}
+
+// restartIfRunning restarts a running monitor so it picks up the profiles
+// just saved: its menu is built once, at start.
+func restartIfRunning() {
+	pid, err := stopRunning()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to stop the running monitor (restart it yourself to apply): %v\n", err)
+		os.Exit(1)
+	}
+	if pid != 0 {
+		handleStart()
+	}
+}
+
+// stopRunning stops the running monitor and returns its PID, or 0 when
 // none was running.
 func stopRunning() (int, error) {
 	pid, ok := readValidPID()
@@ -440,15 +529,15 @@ func createPIDFile() error {
 	return err
 }
 
-// openLogFile opens this instance's log for appending.
+// openLogFile opens the monitor's log for appending.
 func openLogFile() (*os.File, error) {
-	return os.OpenFile(instanceFile(".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
+	return os.OpenFile(monitorFile(".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
 }
 
 // setupDaemonLogging routes the daemon's log output to a file. The daemon runs
 // detached with no terminal attached, so otherwise every log line (transient
 // errors, fetch failures) is discarded and the process cannot be diagnosed
-// after the fact. Logs go to this instance's ~/.claude-monitor-lite*.log.
+// after the fact. Logs go to ~/.claude-monitor-lite.log.
 func setupDaemonLogging() {
 	f, err := openLogFile()
 	if err != nil {
@@ -476,21 +565,25 @@ func onReady() {
 	appCtx, appCancel = context.WithCancel(context.Background())
 
 	setStatusItemName()
-	setMenuBarTitle("⚪ Loading...")
-	systray.SetTooltip(strings.TrimSpace("Claude Monitor Lite " + instanceName()))
+	systray.SetTooltip("Claude Monitor Lite")
 
-	claudeClient = NewUsageClient(CurrentOAuthToken)
-
-	statusMenuItem = systray.AddMenuItem("Loading…", "")
-	statusMenuItem.Disable()
-	rowMenuItems = make([]*systray.MenuItem, maxMenuRows)
-	for i := range rowMenuItems {
-		rowMenuItems[i] = systray.AddMenuItem("", "Click to show in menu bar")
-		rowMenuItems[i].Hide()
+	for _, p := range appConfig.profiles() {
+		monitors = append(monitors, newMonitor(p))
 	}
-	autoMenuItem = systray.AddMenuItem(autoMenuTitle, "Menu bar shows the limit Claude marks as the one to watch")
-	if getMenuBarIndicator() == autoKey {
-		autoMenuItem.Check()
+
+	// One group per profile: its head item, then its rows. With one profile
+	// the menu is the rows alone, exactly as before there were groups.
+	for i, m := range monitors {
+		if i > 0 {
+			systray.AddSeparator()
+		}
+		m.headItem = systray.AddMenuItem("", "")
+		m.headItem.Disable()
+		m.rowItems = make([]*systray.MenuItem, maxMenuRows)
+		for j := range m.rowItems {
+			m.rowItems[j] = systray.AddMenuItem("", "Click to show in menu bar")
+			m.rowItems[j].Hide()
+		}
 	}
 	systray.AddSeparator()
 
@@ -500,25 +593,31 @@ func onReady() {
 
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
-	// A single worker owns all usage fetching, so updateStats never runs
-	// concurrently with itself.
-	go runUpdateWorker(appCtx)
+	displayMu.Lock()
+	render()
+	displayMu.Unlock()
 
-	// One goroutine per row item forwards its clicks — a single static select
-	// cannot cover a pool.
-	for i := range rowMenuItems {
-		go func(idx int) {
-			for {
-				select {
-				case <-appCtx.Done():
-					return
-				case <-rowMenuItems[idx].ClickedCh:
-					if key, ok := rowKeyAt(idx); ok {
-						selectIndicator(key)
+	for _, m := range monitors {
+		// A single worker per profile owns its usage fetching, so updateStats
+		// never runs concurrently with itself.
+		go m.run(appCtx)
+
+		// One goroutine per row item forwards its clicks — a single static
+		// select cannot cover a pool.
+		for j := range m.rowItems {
+			go func(m *monitor, idx int) {
+				for {
+					select {
+					case <-appCtx.Done():
+						return
+					case <-m.rowItems[idx].ClickedCh:
+						if key, ok := m.rowKeyAt(idx); ok {
+							selectIndicator(Indicator{Dir: m.profile.dir, Key: key})
+						}
 					}
 				}
-			}
-		}(i)
+			}(m, j)
+		}
 	}
 
 	// Event loop — handles the rest of the menu.
@@ -531,54 +630,15 @@ func onReady() {
 				appCancel()
 				systray.Quit()
 				return
-			case <-autoMenuItem.ClickedCh:
-				selectIndicator(autoKey)
 			case <-mRefresh.ClickedCh:
-				requestRefresh()
+				for _, m := range monitors {
+					m.requestRefresh()
+				}
 			case <-mAbout.ClickedCh:
 				go showAboutDialog()
 			}
 		}
 	}()
-}
-
-// autoMenuTitle is the auto item's title while a row is pinned instead.
-const autoMenuTitle = "Auto (Claude's pick)"
-
-// rowKeyAt returns the key of the row menu item idx currently shows.
-func rowKeyAt(idx int) (string, bool) {
-	limitsMutex.RLock()
-	cached := lastLimits
-	limitsMutex.RUnlock()
-	if cached == nil {
-		return "", false
-	}
-	rows := usageRows(cached)
-	if idx >= len(rows) {
-		return "", false
-	}
-	return rows[idx].key, true
-}
-
-// selectIndicator switches which usage row the menu bar shows — a row key, or
-// autoKey for the server's pick — redrawing immediately from cached data so
-// the click feels instant.
-func selectIndicator(key string) {
-	// Saving under the same lock keeps rapid clicks from persisting out of order.
-	indicatorMutex.Lock()
-	appConfig.MenuBarIndicator = key
-	err := SaveConfig(appConfig)
-	indicatorMutex.Unlock()
-	if err != nil {
-		log.Printf("Failed to save menu bar indicator: %v", err)
-	}
-
-	limitsMutex.RLock()
-	cached := lastLimits
-	limitsMutex.RUnlock()
-	if cached != nil {
-		applyMenu(cached)
-	}
 }
 
 // showAboutDialog shows a version dialog with a button that opens the project
@@ -589,53 +649,6 @@ if button returned of result is "View on GitHub" then open location "%s"`, versi
 	if err := exec.Command("osascript", "-e", script).Start(); err != nil {
 		log.Printf("Failed to show about dialog: %v", err)
 	}
-}
-
-// showMenuStatus puts a one-line explanation at the top of the menu.
-func showMenuStatus(text string) {
-	statusMenuItem.SetTitle(text)
-	statusMenuItem.Show()
-}
-
-// applyMenu redraws the usage rows, the checkmark and the menu bar title from
-// limits. The checkmark sits on the pinned row, or on the auto item while the
-// menu bar follows the server's pick — which then names the row it picked.
-func applyMenu(limits *UsageLimits) {
-	rows := usageRows(limits)
-	head, auto, ok := headlineRow(rows, getMenuBarIndicator())
-
-	for i, item := range rowMenuItems {
-		if i >= len(rows) {
-			item.Hide()
-			continue
-		}
-		item.SetTitle(formatRow(rows[i], false))
-		if ok && !auto && rows[i].key == head.key {
-			item.Check()
-		} else {
-			item.Uncheck()
-		}
-		item.Show()
-	}
-
-	switch {
-	case auto && ok:
-		autoMenuItem.SetTitle("Auto: " + head.label)
-		autoMenuItem.Check()
-	case auto:
-		autoMenuItem.SetTitle(autoMenuTitle)
-		autoMenuItem.Check()
-	default:
-		autoMenuItem.SetTitle(autoMenuTitle)
-		autoMenuItem.Uncheck()
-	}
-
-	if len(rows) == 0 {
-		showMenuStatus(noLimitsMessage)
-	} else {
-		statusMenuItem.Hide()
-	}
-	setMenuBarTitle(menuBarTitle(head, ok))
 }
 
 // maxTransientErrors is the number of consecutive transient failures tolerated
@@ -673,13 +686,6 @@ func classifyUpdate(err error, consecutiveCount int, haveCache bool) updateActio
 	return actionShowError
 }
 
-// haveLastLimits reports whether a previous successful fetch is cached.
-func haveLastLimits() bool {
-	limitsMutex.RLock()
-	defer limitsMutex.RUnlock()
-	return lastLimits != nil
-}
-
 // nextPollDelay returns the base interval normally, and on consecutive
 // rate-limited (429) polls backs off exponentially from base toward max.
 // rateLimitFailures is the count of consecutive 429s including this one
@@ -714,173 +720,6 @@ func withJitter(d time.Duration) time.Duration {
 	}
 	delta := (rand.Float64()*2 - 1) * pollJitterFraction * float64(d)
 	return d + time.Duration(delta)
-}
-
-// refreshTrigger asks the update worker to fetch now. Sends coalesce, so rapid
-// refresh requests do not pile up.
-var refreshTrigger = make(chan struct{}, 1)
-
-func requestRefresh() {
-	select {
-	case refreshTrigger <- struct{}{}:
-	default:
-	}
-}
-
-// The update worker's view of the two usage sources. Touched only by the
-// update worker.
-var (
-	// polledLimits is what the last successful poll returned: the base that
-	// status line readings are laid over.
-	polledLimits *UsageLimits
-	// lastPollAt is when that poll was sent. Only a status line reading that
-	// changed after it can add to what the poll said. Starting at process
-	// start keeps a reading left over from before the daemon ran from being
-	// shown as current.
-	lastPollAt = time.Now()
-	// statusLineSeenAt is the mtime of the status line feed last looked at.
-	statusLineSeenAt time.Time
-)
-
-// runUpdateWorker is the single goroutine that fetches usage data — on a timer
-// and on demand. Confining fetches to one goroutine means updateStats never
-// runs concurrently with itself. The timer is rescheduled after every fetch
-// using the delay updateStats returns — the base interval normally, backed
-// off further while the endpoint is rate-limiting us — with jitter applied so
-// this monitor does not beat in lockstep with others polling the same
-// endpoint. Between polls it also applies status line updates, which cost no
-// request (statusline.go).
-func runUpdateWorker(ctx context.Context) {
-	delay := updateStats() // initial fetch
-	timer := time.NewTimer(withJitter(delay))
-	defer timer.Stop()
-	statusLineTicker := time.NewTicker(statusLineCheckInterval)
-	defer statusLineTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-statusLineTicker.C:
-			applyStatusLineUpdate()
-		case <-timer.C:
-			delay = updateStats()
-			timer.Reset(withJitter(delay))
-		case <-refreshTrigger:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			delay = updateStats()
-			timer.Reset(withJitter(delay))
-		}
-	}
-}
-
-// updateStats fetches usage data once and updates the menu bar accordingly.
-// It returns the next base poll delay (pre-jitter): refreshInterval on
-// success or on a non-rate-limit error, or a value backed off toward
-// maxBackoffInterval while the endpoint keeps returning 429.
-func updateStats() time.Duration {
-	// Stamped before the request, so a status line update written while it is
-	// in flight still counts as newer than this poll.
-	polledAt := time.Now()
-	limits, err := claudeClient.GetUsageLimits()
-	if errors.Is(err, ErrAuthFailed) {
-		// The cached token was rejected. Drop it and retry once so
-		// CurrentOAuthToken re-reads Claude Code's credential (which Claude Code
-		// may have refreshed) before we tell a logged-in user to log in again.
-		InvalidateOAuthToken()
-		limits, err = claudeClient.GetUsageLimits()
-	}
-	if err != nil {
-		var rl *RateLimitError
-		isRateLimit := errors.As(err, &rl)
-
-		consecutiveMutex.Lock()
-		consecutiveErrors++
-		count := consecutiveErrors
-		var delay time.Duration
-		if isRateLimit {
-			consecutiveRateLimits++
-			delay = nextPollDelay(refreshInterval, maxBackoffInterval, consecutiveRateLimits, rl.RetryAfter)
-		} else {
-			consecutiveRateLimits = 0
-			delay = refreshInterval
-		}
-		consecutiveMutex.Unlock()
-
-		action := classifyUpdate(err, count, haveLastLimits())
-
-		switch action {
-		case actionShowAuth:
-			showMenuStatus("No Claude subscription login in Claude Code")
-			setMenuBarTitle("⚪ Login")
-		case actionKeepStale:
-			log.Printf("Transient error (%d/%d): %v", count, maxTransientErrors, err)
-		case actionShowError:
-			log.Printf("Error fetching usage: %v", err)
-			setMenuBarTitle("⚪ Error")
-			showMenuStatus("Error loading data")
-		}
-		return delay
-	}
-
-	// Success — reset both error counters
-	consecutiveMutex.Lock()
-	consecutiveErrors = 0
-	consecutiveRateLimits = 0
-	consecutiveMutex.Unlock()
-
-	polledLimits, lastPollAt = limits, polledAt
-	// A reading that changed while the request was in flight is newer than
-	// this poll, and the tick that applied it will not fire again for it.
-	feed, _ := readStatusLineFeed()
-	if live := feed.liveSince(polledAt, time.Now()); live != nil {
-		limits = mergeStatusLine(limits, live)
-	}
-	showLimits(limits)
-	return refreshInterval
-}
-
-// applyStatusLineUpdate lays the status line readings that changed after the
-// last poll over it. It runs when the feed file changes; a change that brings
-// nothing newer than the poll leaves the display alone.
-func applyStatusLineUpdate() {
-	feed, seenAt, err := readStatusLineUpdate(statusLineSeenAt)
-	statusLineSeenAt = seenAt
-	if err != nil {
-		log.Printf("Failed to read status line usage: %v", err)
-		return
-	}
-	// Before the first poll there are no rows for a reading to update.
-	if feed == nil || polledLimits == nil {
-		return
-	}
-	if live := feed.liveSince(lastPollAt, time.Now()); live != nil {
-		showLimits(mergeStatusLine(polledLimits, live))
-	}
-}
-
-// showLimits makes limits the displayed usage: menu items, menu bar, and the
-// cache the status command reads.
-func showLimits(limits *UsageLimits) {
-	// Store limits for instant display switching (thread-safe)
-	limitsMutex.Lock()
-	lastLimits = limits
-	limitsMutex.Unlock()
-
-	applyMenu(limits)
-
-	// The status command reads this instead of calling the API itself, which
-	// would spend the same per-account rate-limit budget as this poll.
-	if data, err := json.Marshal(limits); err == nil {
-		if err := writeFileAtomic(instanceFile(".usage.json"), data, configFilePermissions); err != nil {
-			log.Printf("Failed to write usage cache: %v", err)
-		}
-	}
 }
 
 func onExit() {

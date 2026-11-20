@@ -250,8 +250,8 @@ func mergeStatusLine(base *UsageLimits, live *liveWindows) *UsageLimits {
 
 // statusLineUsageFile holds the status line feed. Its mtime is when some
 // session's reading last changed.
-func statusLineUsageFile() string {
-	return instanceFile(".statusline-usage.json")
+func statusLineUsageFile(p profile) string {
+	return p.file(".statusline-usage.json")
 }
 
 // statusLineWrapFile holds, as plain text, the status line command
@@ -259,12 +259,12 @@ func statusLineUsageFile() string {
 // wrapper prints nothing. Its existence marks the feed as installed. It lives
 // apart from the config because the daemon rewrites the config from memory on
 // every indicator click, which would drop it.
-func statusLineWrapFile() string {
-	return instanceFile(".statusline-wrap")
+func statusLineWrapFile(p profile) string {
+	return p.file(".statusline-wrap")
 }
 
-func readStatusLineWrap() (string, error) {
-	data, err := os.ReadFile(statusLineWrapFile())
+func readStatusLineWrap(p profile) (string, error) {
+	data, err := os.ReadFile(statusLineWrapFile(p))
 	return string(data), err
 }
 
@@ -282,15 +282,18 @@ func runStatusLine() {
 		logStatusLineError(errors.New("wrapped status line command runs claude-monitor-lite itself; run `statusline uninstall`, fix statusLine.command, then install again"))
 		return
 	}
+	// Claude Code runs this with its own CLAUDE_CONFIG_DIR, which is what says
+	// whose usage the render carries.
+	p := envProfile()
 	input, err := io.ReadAll(os.Stdin)
 	if err == nil {
-		err = saveStatusLineUsage(input)
+		err = saveStatusLineUsage(p, input)
 	}
 	if err != nil {
 		logStatusLineError(err)
 	}
 
-	wrapped, err := readStatusLineWrap()
+	wrapped, err := readStatusLineWrap(p)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			logStatusLineError(err)
@@ -322,14 +325,14 @@ func runStatusLine() {
 // The read-merge-write is unlocked: two sessions saving in the same instant
 // can drop one's reading, but that session records it again on its next
 // render, which is cheaper than a file lock on every render.
-func saveStatusLineUsage(input []byte) error {
+func saveStatusLineUsage(p profile, input []byte) error {
 	session, limits, err := statusLineLimits(input)
 	if err != nil || limits == nil {
 		return err
 	}
 	// An unreadable feed (a crash can leave the file empty) is replaced
 	// rather than repaired.
-	feed, _ := readStatusLineFeed()
+	feed, _ := readStatusLineFeed(p)
 	now := time.Now()
 	if !feed.record(session, limits, now) {
 		return nil
@@ -339,14 +342,14 @@ func saveStatusLineUsage(input []byte) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(statusLineUsageFile(), data, configFilePermissions)
+	return writeFileAtomic(statusLineUsageFile(p), data, configFilePermissions)
 }
 
 // readStatusLineFeed reads the feed; a missing file is an empty feed. It
 // always returns a usable feed, alongside the error when the file is bad.
-func readStatusLineFeed() (*statusLineFeed, error) {
+func readStatusLineFeed(p profile) (*statusLineFeed, error) {
 	feed := &statusLineFeed{}
-	data, err := os.ReadFile(statusLineUsageFile())
+	data, err := os.ReadFile(statusLineUsageFile(p))
 	if err == nil {
 		err = json.Unmarshal(data, feed)
 	} else if os.IsNotExist(err) {
@@ -358,7 +361,7 @@ func readStatusLineFeed() (*statusLineFeed, error) {
 	return feed, err
 }
 
-// logStatusLineError appends to this instance's log. Stdout is the user's
+// logStatusLineError appends to the monitor's log. Stdout is the user's
 // status line and stderr is not shown, so the log is the only place an error
 // can surface.
 func logStatusLineError(err error) {
@@ -373,8 +376,8 @@ func logStatusLineError(err error) {
 // readStatusLineUpdate returns the feed if its file changed after since, or
 // nil. The returned time is the file's mtime, advanced past a bad write too,
 // so that one is reported once rather than on every tick.
-func readStatusLineUpdate(since time.Time) (*statusLineFeed, time.Time, error) {
-	info, err := os.Stat(statusLineUsageFile())
+func readStatusLineUpdate(p profile, since time.Time) (*statusLineFeed, time.Time, error) {
+	info, err := os.Stat(statusLineUsageFile(p))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, since, nil
@@ -384,7 +387,7 @@ func readStatusLineUpdate(since time.Time) (*statusLineFeed, time.Time, error) {
 	if !info.ModTime().After(since) {
 		return nil, since, nil
 	}
-	feed, err := readStatusLineFeed()
+	feed, err := readStatusLineFeed(p)
 	if err != nil {
 		return nil, info.ModTime(), err
 	}
@@ -401,8 +404,8 @@ func isStatusLineFeed(command string) bool {
 }
 
 // statusLineFeedCommand is the command Claude Code is pointed at. A
-// CLAUDE_CONFIG_DIR instance pins the variable in the command, so the
-// wrapper saves to that instance's files even if Claude Code were started
+// CLAUDE_CONFIG_DIR environment pins the variable in the command, so the
+// wrapper saves to that profile's files even if Claude Code were started
 // without it in the environment.
 func statusLineFeedCommand(binaryPath, configDir string) string {
 	cmd := shellQuote(binaryPath) + " statusline"
@@ -615,11 +618,11 @@ func uninstallStatusLineSettings(settings []byte, original, feed string) (out []
 	return out, true, err
 }
 
-// claudeSettingsPath is Claude Code's user settings file for this instance,
+// claudeSettingsPath is Claude Code's user settings file for the profile,
 // with symlinks resolved so a dotfiles-managed settings.json is edited in
 // place rather than replaced by a plain file.
-func claudeSettingsPath() string {
-	path := filepath.Join(absConfigDir(), "settings.json")
+func claudeSettingsPath(p profile) string {
+	path := filepath.Join(p.configDir(), "settings.json")
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved
 	}
@@ -658,24 +661,23 @@ func handleStatusLine(args []string) {
 	}
 }
 
-// currentFeedCommand is the feed command for this binary and instance.
-func currentFeedCommand() string {
+// currentFeedCommand is the feed command for this binary and profile.
+func currentFeedCommand(p profile) string {
 	binPath, err := resolveBinaryPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to resolve binary path: %v\n", err)
 		os.Exit(1)
 	}
-	configDir := ""
-	if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
-		configDir = absConfigDir()
-	}
-	return statusLineFeedCommand(binPath, configDir)
+	return statusLineFeedCommand(binPath, p.dir)
 }
 
+// The install and uninstall commands act on the environment they are run in,
+// like Claude Code itself: set CLAUDE_CONFIG_DIR to wire up another profile.
 func handleStatusLineInstall() {
-	feed := currentFeedCommand()
+	p := envProfile()
+	feed := currentFeedCommand(p)
 
-	path := claudeSettingsPath()
+	path := claudeSettingsPath(p)
 	settings, perm, err := readSettings(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", path, err)
@@ -690,15 +692,15 @@ func handleStatusLineInstall() {
 	if already {
 		// The wrap file from the first install still holds the original;
 		// without it the wrapper would silently drop the user's status line.
-		if _, err := readStatusLineWrap(); err != nil {
-			fmt.Fprintf(os.Stderr, "Status line already points at claude-monitor-lite, but %s is unreadable (%v).\n", statusLineWrapFile(), err)
+		if _, err := readStatusLineWrap(p); err != nil {
+			fmt.Fprintf(os.Stderr, "Status line already points at claude-monitor-lite, but %s is unreadable (%v).\n", statusLineWrapFile(p), err)
 			fmt.Fprintln(os.Stderr, "Set statusLine.command in settings.json back to your own command, then install again.")
 			os.Exit(1)
 		}
 	} else {
 		// Record the original before touching settings.json, so a failure
 		// here leaves Claude Code exactly as it was.
-		if err := writeFileAtomic(statusLineWrapFile(), []byte(original), configFilePermissions); err != nil {
+		if err := writeFileAtomic(statusLineWrapFile(p), []byte(original), configFilePermissions); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to save the original status line: %v\n", err)
 			os.Exit(1)
 		}
@@ -731,26 +733,27 @@ func handleStatusLineInstall() {
 }
 
 func handleStatusLineUninstall() {
-	wrapped, err := readStatusLineWrap()
+	p := envProfile()
+	wrapped, err := readStatusLineWrap(p)
 	if err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", statusLineWrapFile(), err)
+		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", statusLineWrapFile(p), err)
 		os.Exit(1)
 	}
 	installed := err == nil
 
-	path := claudeSettingsPath()
+	path := claudeSettingsPath(p)
 	settings, perm, err := readSettings(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", path, err)
 		os.Exit(1)
 	}
-	out, ours, err := uninstallStatusLineSettings(settings, wrapped, currentFeedCommand())
+	out, ours, err := uninstallStatusLineSettings(settings, wrapped, currentFeedCommand(p))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to update %s: %v\n", path, err)
 		os.Exit(1)
 	}
 	if ours && !installed {
-		fmt.Fprintf(os.Stderr, "The status line points at claude-monitor-lite, but the original command was not recorded (%s missing).\n", statusLineWrapFile())
+		fmt.Fprintf(os.Stderr, "The status line points at claude-monitor-lite, but the original command was not recorded (%s missing).\n", statusLineWrapFile(p))
 		fmt.Fprintln(os.Stderr, "Edit statusLine in settings.json by hand.")
 		os.Exit(1)
 	}
@@ -758,7 +761,7 @@ func handleStatusLineUninstall() {
 		// The wrap file may be the only remaining copy of the original
 		// command, so it stays.
 		if installed {
-			fmt.Printf("✓ Status line no longer points at claude-monitor-lite; left settings.json as is.\n  Your earlier command is kept in %s\n", statusLineWrapFile())
+			fmt.Printf("✓ Status line no longer points at claude-monitor-lite; left settings.json as is.\n  Your earlier command is kept in %s\n", statusLineWrapFile(p))
 		} else {
 			fmt.Println("✓ Status line feed not installed (nothing to remove).")
 		}
@@ -769,7 +772,7 @@ func handleStatusLineUninstall() {
 		fmt.Fprintf(os.Stderr, "Failed to write %s: %v\n", path, err)
 		os.Exit(1)
 	}
-	for _, f := range []string{statusLineWrapFile(), statusLineUsageFile()} {
+	for _, f := range []string{statusLineWrapFile(p), statusLineUsageFile(p)} {
 		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "Warning: failed to remove %s: %v\n", f, err)
 		}

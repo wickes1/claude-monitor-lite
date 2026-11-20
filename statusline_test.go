@@ -105,25 +105,25 @@ func TestSaveStatusLineUsageSkipsUnchanged(t *testing.T) {
 	withTempHome(t)
 	reset := time.Now().Add(time.Hour)
 
-	if err := saveStatusLineUsage(statusLineRender("a", 4, 20, reset)); err != nil {
+	if err := saveStatusLineUsage(profile{}, statusLineRender("a", 4, 20, reset)); err != nil {
 		t.Fatal(err)
 	}
 	past := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(statusLineUsageFile(), past, past); err != nil {
+	if err := os.Chtimes(statusLineUsageFile(profile{}), past, past); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := saveStatusLineUsage(statusLineRender("a", 4, 20, reset)); err != nil {
+	if err := saveStatusLineUsage(profile{}, statusLineRender("a", 4, 20, reset)); err != nil {
 		t.Fatal(err)
 	}
-	if feed, _, _ := readStatusLineUpdate(past); feed != nil {
+	if feed, _, _ := readStatusLineUpdate(profile{}, past); feed != nil {
 		t.Error("unchanged render rewrote the usage file")
 	}
 
-	if err := saveStatusLineUsage(statusLineRender("a", 5, 20, reset)); err != nil {
+	if err := saveStatusLineUsage(profile{}, statusLineRender("a", 5, 20, reset)); err != nil {
 		t.Fatal(err)
 	}
-	feed, _, err := readStatusLineUpdate(past)
+	feed, _, err := readStatusLineUpdate(profile{}, past)
 	if err != nil || feed == nil {
 		t.Fatalf("changed render not picked up: %+v, %v", feed, err)
 	}
@@ -210,13 +210,13 @@ func TestStatusLineFeedDropsExpiredWindows(t *testing.T) {
 func TestSaveStatusLineUsageReplacesUnreadableFile(t *testing.T) {
 	for _, content := range []string{"", "{not json"} {
 		withTempHome(t)
-		if err := os.WriteFile(statusLineUsageFile(), []byte(content), 0600); err != nil {
+		if err := os.WriteFile(statusLineUsageFile(profile{}), []byte(content), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := saveStatusLineUsage(statusLineRender("a", 2, 3, time.Now().Add(time.Hour))); err != nil {
+		if err := saveStatusLineUsage(profile{}, statusLineRender("a", 2, 3, time.Now().Add(time.Hour))); err != nil {
 			t.Fatal(err)
 		}
-		feed, err := readStatusLineFeed()
+		feed, err := readStatusLineFeed(profile{})
 		if err != nil || len(feed.Sessions) != 1 || feed.Sessions["a"] == nil {
 			t.Errorf("after %q: feed = %+v, %v; want session a recorded", content, feed.Sessions, err)
 		}
@@ -415,7 +415,7 @@ func TestRunStatusLineGuardStopsRecursion(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	marker := home + "/ran"
-	if err := os.WriteFile(statusLineWrapFile(), []byte("touch "+marker), 0600); err != nil {
+	if err := os.WriteFile(statusLineWrapFile(profile{}), []byte("touch "+marker), 0600); err != nil {
 		t.Fatal(err)
 	}
 	stdin, err := os.Open(os.DevNull)

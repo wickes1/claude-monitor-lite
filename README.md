@@ -11,7 +11,7 @@ A lightweight menu bar monitor that displays **real-time rate limits** from your
 - Traffic light indicator: 🟢 Green (0-49%), 🟡 Yellow (50-79%), 🔴 Red (80%+)
 - Refreshes every 3 minutes, backing off further when the usage endpoint rate-limits; keeps the last numbers while rate-limited, but shows "Error" if fetching keeps failing for any other reason
 - Optional live mode: updates within seconds while you use Claude Code, fed by its status line (see [Live updates](#live-updates))
-- Watches several Claude Code environments side by side (e.g. personal and work)
+- Watches several Claude Code environments in one menu (e.g. personal and work), each as a group named after its account (see [Several accounts](#several-accounts))
 
 **Platform:** macOS. A Linux build is published but untested; `install` is macOS-only.
 
@@ -51,7 +51,7 @@ Weekly (Fable):    3%  (resets 2026-11-19 20:00, in 58h 20m)
 Menu Bar Shows:  5-Hour Session (🟢 12%)
 ```
 
-**Switching metrics:** click a row in the menu to pin it to the menu bar. **Auto (Claude's pick)**, the default, shows the limit Claude itself marks as the one to watch. The menu bar also falls back to it when a pinned row is no longer part of your plan.
+**Switching metrics:** click a row in the menu to pin it to the menu bar; the checkmark is on the row it shows. Until you pin one, the menu bar shows the limit Claude itself marks as the one to watch, and it falls back to that when a pinned row is no longer part of your plan.
 
 ## Plans
 
@@ -73,6 +73,8 @@ Not covered, because there are no plan limits to read: API key and Console login
 ```bash
 claude-monitor-lite              # Start or show status
 claude-monitor-lite stop         # Stop the monitor
+claude-monitor-lite add <dir>    # Also watch the Claude Code environment in <dir>
+claude-monitor-lite remove <dir> # Stop watching it ("default" names ~/.claude)
 claude-monitor-lite install      # Start automatically at login
 claude-monitor-lite uninstall    # Stop starting at login
 claude-monitor-lite statusline install    # Live updates from Claude Code's status line
@@ -82,15 +84,34 @@ claude-monitor-lite version      # Show version
 
 ## Which login it reads
 
-The monitor reads whichever Claude Code environment it is started in: `~/.claude` by default, or `CLAUDE_CONFIG_DIR` when that is set. Claude Code isolates everything user-scope under that directory — login/subscription, settings, MCP servers, skills, and history — so launching the monitor from a shell with `CLAUDE_CONFIG_DIR` set monitors that environment instead:
+The monitor reads Claude Code's own login: the default environment, `~/.claude`, unless told otherwise. It is read-only toward the credential store: it never writes a Keychain item or credentials file and never refreshes a token — the login is owned by Claude Code. On macOS the credential is the `Claude Code-credentials` Keychain item, or `Claude Code-credentials-<sha256(dir)[:8]>` for a `CLAUDE_CONFIG_DIR` environment (Claude Code's own naming); on Linux it is `<dir>/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)).
+
+## Several accounts
+
+Claude Code keeps a second account apart by running with `CLAUDE_CONFIG_DIR` set: login, settings, MCP servers, skills and history all live under that directory. Tell the monitor about such an environment once and it watches it alongside the default one:
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.claude-work claude-monitor-lite
+claude-monitor-lite add ~/.claude-work
 ```
 
-Each environment runs as its own instance, so two accounts can be watched side by side: start one plainly and one with `CLAUDE_CONFIG_DIR` set. A `CLAUDE_CONFIG_DIR` instance is named after the directory (`~/.claude-work` → `claude-work`), and its menu bar title carries that prefix. Its files are `~/.claude-monitor-lite.<name>-<hash>.{json,pid,log,usage.json,statusline-usage.json,statusline-wrap}`, where `<hash>` is the same directory hash Claude Code uses, so two directories with the same folder name never collide. Run `install` / `stop` / `uninstall` with the same `CLAUDE_CONFIG_DIR` to act on that instance; its LaunchAgent records the variable so autostart watches the same account.
+The menu then has one group per environment, each with the same rows as before:
 
-It is read-only toward the credential store: it never writes a Keychain item or credentials file and never refreshes a token — the login is owned by Claude Code. On macOS the credential is the `Claude Code-credentials` Keychain item, or `Claude Code-credentials-<sha256(dir)[:8]>` when `CLAUDE_CONFIG_DIR` is set (Claude Code's own naming); on Linux it is `<dir>/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)).
+```
+Ada (Max)
+✓ 5-Hour Session: 12% (resets 2026-11-17 14:10, in 4h 30m)
+  Weekly (All): 3% (resets 2026-11-19 20:00, in 58h 20m)
+─────────────
+Ada · Acme (Team)
+  5-Hour Session: 40% (resets 2026-11-17 12:50, in 3h 10m)
+  Weekly (All): 21% (resets 2026-11-21 09:00, in 95h 20m)
+```
+
+- **Names** come from the account logged in there, as Claude Code records it: your name, the organization for a Team or Enterprise seat, and the plan in brackets. An environment whose account cannot be read is named after its folder.
+- **The menu bar** still shows one row, without a name: click a row in any group to pin it. Until you do, it shows the first environment's pick.
+- **Each group stands alone.** One account failing to load says so in its own group and leaves the menu bar to the selected one.
+- **Files:** the list is kept in `~/.claude-monitor-lite.json` (`profiles`, in menu order; an empty string is the default environment). The monitor has one PID file, log and LaunchAgent however many environments it watches; the usage cache and status line feed of an added environment are `~/.claude-monitor-lite.<folder>-<hash>.*`, with the same directory hash Claude Code uses.
+
+`claude-monitor-lite remove ~/.claude-work` stops watching it. Both commands restart a running monitor.
 
 ## Live updates
 
@@ -104,6 +125,8 @@ This points `statusLine.command` in `~/.claude/settings.json` (or `$CLAUDE_CONFI
 
 While Claude Code is in use the menu bar then follows within seconds, at no extra API cost. Polling continues every 3 minutes for everything the status line does not carry: usage from claude.ai or the desktop app, usage credits, and per-model weekly limits. Needs a Claude.ai subscription and a Claude Code version whose status line input includes `rate_limits`; otherwise the monitor simply keeps polling.
 
+The command acts on the environment it is run in, like Claude Code itself. For an added environment, run it with that directory: `CLAUDE_CONFIG_DIR=~/.claude-work claude-monitor-lite statusline install`.
+
 `claude-monitor-lite statusline uninstall` restores your original command. Run it before removing the binary (e.g. `brew uninstall`), or Claude Code's status line goes blank. Install again after moving the binary (e.g. switching from a source build to Homebrew) so the status line points at the new path.
 
 ## Start at login
@@ -114,7 +137,7 @@ Register a LaunchAgent so the monitor starts automatically when you log in:
 claude-monitor-lite install
 ```
 
-This writes `~/Library/LaunchAgents/io.github.wickes1.claude-monitor-lite.plist` (`….claude-monitor-lite.<name>-<hash>.plist` for a `CLAUDE_CONFIG_DIR` instance) pointing at the binary on your `PATH`, so it keeps working across `brew upgrade`. To disable:
+This writes `~/Library/LaunchAgents/io.github.wickes1.claude-monitor-lite.plist` pointing at the binary on your `PATH`, so it keeps working across `brew upgrade`. To disable:
 
 ```bash
 claude-monitor-lite uninstall
@@ -125,5 +148,7 @@ claude-monitor-lite uninstall
 ## Troubleshooting
 
 **Menu bar shows "Login":** Claude Code's login is missing, rejected, or not a Claude subscription login (an API key or Console login has no plan limits). Log in to Claude Code with your subscription; the monitor picks it up on its next refresh.
+
+**"Waiting for Claude Code":** the access token of that environment has expired. Claude Code renews its token only while it runs, and the monitor never renews it itself, so an environment you have not used for some hours stops updating; the rows are the last reading, with its time. They resume on the next refresh after Claude Code runs there. With the menu bar set to one of those rows, it shows "Error" until then.
 
 **App not responding:** Run `killall claude-monitor-lite` then restart.

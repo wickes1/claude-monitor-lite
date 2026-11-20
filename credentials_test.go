@@ -7,34 +7,16 @@ import (
 	"time"
 )
 
-// saveOAuthTokenVars snapshots the package-level OAuth token state (the
-// injectable credential reader and the in-memory cache) and restores it on
-// cleanup, so each test can substitute a fake without leaking into others.
-func saveOAuthTokenVars(t *testing.T) {
-	t.Helper()
-	origRead := readCredential
-	origCached := cachedOAuthCredential
-	t.Cleanup(func() {
-		oauthTokenMu.Lock()
-		readCredential = origRead
-		cachedOAuthCredential = origCached
-		oauthTokenMu.Unlock()
-	})
-}
-
 // A fresh, non-expired credential from Claude Code's store is returned as-is.
-func TestCurrentOAuthToken_FreshCredential_Returned(t *testing.T) {
-	saveOAuthTokenVars(t)
-	cachedOAuthCredential = nil
-
-	readCredential = func() (*OAuthCredential, error) {
+func TestToken_FreshCredential_Returned(t *testing.T) {
+	src := &credentialSource{read: func() (*OAuthCredential, error) {
 		return &OAuthCredential{
 			AccessToken: "fresh-token",
 			ExpiresAt:   time.Now().Add(time.Hour).UnixMilli(),
 		}, nil
-	}
+	}}
 
-	token, err := CurrentOAuthToken()
+	token, err := src.token()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
@@ -47,39 +29,38 @@ func TestCurrentOAuthToken_FreshCredential_Returned(t *testing.T) {
 // refresh grant could rotate its token and force the user to sign back into
 // Claude Code. We report transient and wait for Claude Code to refresh its own
 // token, so the caller keeps last-good data instead of forcing a re-login.
-func TestCurrentOAuthToken_ExpiredCredential_ReturnsTransient(t *testing.T) {
-	saveOAuthTokenVars(t)
-	cachedOAuthCredential = nil
-
-	readCredential = func() (*OAuthCredential, error) {
+func TestToken_ExpiredCredential_ReturnsTransient(t *testing.T) {
+	src := &credentialSource{read: func() (*OAuthCredential, error) {
 		return &OAuthCredential{
 			AccessToken: "stale-token",
 			ExpiresAt:   time.Now().Add(-time.Hour).UnixMilli(), // already expired
 		}, nil
-	}
+	}}
 
-	_, err := CurrentOAuthToken()
+	_, err := src.token()
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("expected ErrTransient (must not spend Claude Code's refresh grant), got: %v", err)
 	}
+	// The menu tells this wait apart from an outage: it is the normal state of
+	// an environment Claude Code is not running in.
+	if !errors.Is(err, ErrTokenExpired) {
+		t.Errorf("expected ErrTokenExpired, got: %v", err)
+	}
 }
 
-// After InvalidateOAuthToken, the next call must re-read rather than serve a
+// After invalidate, the next call must re-read rather than serve a
 // cached token — and, within the cache window, a second call must NOT re-read.
-func TestCurrentOAuthToken_Invalidate_ForcesReread(t *testing.T) {
-	saveOAuthTokenVars(t)
-	cachedOAuthCredential = nil
-
+func TestToken_Invalidate_ForcesReread(t *testing.T) {
 	reads := 0
-	readCredential = func() (*OAuthCredential, error) {
+	src := &credentialSource{read: func() (*OAuthCredential, error) {
 		reads++
 		return &OAuthCredential{
 			AccessToken: "token",
 			ExpiresAt:   time.Now().Add(time.Hour).UnixMilli(),
 		}, nil
-	}
+	}}
 
-	if _, err := CurrentOAuthToken(); err != nil {
+	if _, err := src.token(); err != nil {
 		t.Fatalf("first call: expected success, got: %v", err)
 	}
 	if reads != 1 {
@@ -87,16 +68,16 @@ func TestCurrentOAuthToken_Invalidate_ForcesReread(t *testing.T) {
 	}
 
 	// Within the cache window, a second call must reuse the cache.
-	if _, err := CurrentOAuthToken(); err != nil {
+	if _, err := src.token(); err != nil {
 		t.Fatalf("second call: expected success, got: %v", err)
 	}
 	if reads != 1 {
 		t.Fatalf("reads after cached second call = %d, want 1 (cache should have been used)", reads)
 	}
 
-	InvalidateOAuthToken()
+	src.invalidate()
 
-	if _, err := CurrentOAuthToken(); err != nil {
+	if _, err := src.token(); err != nil {
 		t.Fatalf("third call: expected success, got: %v", err)
 	}
 	if reads != 2 {
@@ -107,16 +88,13 @@ func TestCurrentOAuthToken_Invalidate_ForcesReread(t *testing.T) {
 // When Claude Code's credential store cannot be read at all (not installed,
 // not logged in), the read error itself must propagate so the caller can
 // report why.
-func TestCurrentOAuthToken_ReadFails_PropagatesReadError(t *testing.T) {
-	saveOAuthTokenVars(t)
-	cachedOAuthCredential = nil
-
+func TestToken_ReadFails_PropagatesReadError(t *testing.T) {
 	wantErr := errors.New("no Claude Code credential found")
-	readCredential = func() (*OAuthCredential, error) {
+	src := &credentialSource{read: func() (*OAuthCredential, error) {
 		return nil, wantErr
-	}
+	}}
 
-	_, err := CurrentOAuthToken()
+	_, err := src.token()
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected the read error to propagate, got: %v", err)
 	}
@@ -124,21 +102,19 @@ func TestCurrentOAuthToken_ReadFails_PropagatesReadError(t *testing.T) {
 
 // A cached credential's own expiry must still be respected — an expired cache
 // entry must not be served, it must fall through to re-reading.
-func TestCurrentOAuthToken_ExpiredCache_ReReads(t *testing.T) {
-	saveOAuthTokenVars(t)
-	cachedOAuthCredential = &OAuthCredential{
-		AccessToken: "old-cached-token",
-		ExpiresAt:   time.Now().Add(-time.Hour).UnixMilli(), // expired
-	}
-
-	readCredential = func() (*OAuthCredential, error) {
+func TestToken_ExpiredCache_ReReads(t *testing.T) {
+	src := &credentialSource{read: func() (*OAuthCredential, error) {
 		return &OAuthCredential{
 			AccessToken: "new-token",
 			ExpiresAt:   time.Now().Add(time.Hour).UnixMilli(),
 		}, nil
+	}}
+	src.cached = &OAuthCredential{
+		AccessToken: "old-cached-token",
+		ExpiresAt:   time.Now().Add(-time.Hour).UnixMilli(), // expired
 	}
 
-	token, err := CurrentOAuthToken()
+	token, err := src.token()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
@@ -147,15 +123,22 @@ func TestCurrentOAuthToken_ExpiredCache_ReReads(t *testing.T) {
 	}
 }
 
-// InvalidateOAuthToken must be safe to call with no cached credential.
-func TestInvalidateOAuthToken_NoCachedCredential_NoPanic(t *testing.T) {
-	saveOAuthTokenVars(t)
-	cachedOAuthCredential = nil
-
-	InvalidateOAuthToken()
-
-	if cachedOAuthCredential != nil {
-		t.Error("cachedOAuthCredential should remain nil")
+// Two profiles are two accounts: one's token must never be handed out for
+// the other, or its group would show the wrong account's usage.
+func TestTokenIsPerProfile(t *testing.T) {
+	source := func(token string) *credentialSource {
+		return &credentialSource{read: func() (*OAuthCredential, error) {
+			return &OAuthCredential{AccessToken: token, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}, nil
+		}}
+	}
+	personal, work := source("personal-token"), source("work-token")
+	for _, tc := range []struct {
+		src  *credentialSource
+		want string
+	}{{personal, "personal-token"}, {work, "work-token"}, {personal, "personal-token"}} {
+		if got, err := tc.src.token(); err != nil || got != tc.want {
+			t.Errorf("token() = %q, %v, want %q", got, err, tc.want)
+		}
 	}
 }
 
@@ -164,8 +147,7 @@ func TestInvalidateOAuthToken_NoCachedCredential_NoPanic(t *testing.T) {
 // other environment's label. The hash follows Claude Code's own naming,
 // checked against an item it created in a real Keychain.
 func TestKeychainService(t *testing.T) {
-	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	if got := keychainService(); got != keychainServiceBase {
+	if got := newProfile("").keychainService(); got != keychainServiceBase {
 		t.Errorf("default env: got %q, want plain %q", got, keychainServiceBase)
 	}
 
@@ -175,9 +157,8 @@ func TestKeychainService(t *testing.T) {
 		"/Users/alice/.claude-work/",
 		"/Users/alice/x/../.claude-work",
 	} {
-		t.Setenv("CLAUDE_CONFIG_DIR", dir)
-		if got := keychainService(); got != want {
-			t.Errorf("CLAUDE_CONFIG_DIR=%q: got %q, want %q", dir, got, want)
+		if got := newProfile(dir).keychainService(); got != want {
+			t.Errorf("config dir %q: got %q, want %q", dir, got, want)
 		}
 	}
 }

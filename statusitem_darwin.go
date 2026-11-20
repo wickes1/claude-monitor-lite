@@ -19,15 +19,10 @@ static void setStatusItemAutosaveName(char *name) {
 */
 import "C"
 
-// setStatusItemName gives this instance's menu bar item its own autosave name.
-// systray leaves the default "Item-0", and a bare binary's defaults domain is
-// its executable name, so every instance shared one saved position and one
-// identity (process name + window title) in menu bar managers like Ice — two
-// instances running at once fought over placement and Ice mixed them up.
+// setStatusItemName gives the menu bar item its own autosave name. systray
+// leaves the default "Item-0", which the item would share with every other
+// systray app whose defaults domain is a bare executable name; under its own
+// name macOS and menu bar managers like Ice keep its position and identity.
 func setStatusItemName() {
-	name := "claude-monitor-lite"
-	if id := instanceID(); id != "" {
-		name += "." + id
-	}
-	C.setStatusItemAutosaveName(C.CString(name))
+	C.setStatusItemAutosaveName(C.CString("claude-monitor-lite"))
 }
