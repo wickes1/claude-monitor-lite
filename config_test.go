@@ -184,10 +184,11 @@ func TestProfilePaths(t *testing.T) {
 }
 
 // A group is named after the account logged in to its profile, always in the
-// same shape: person, organization, plan in brackets. The names come from
-// Claude Code's own bookkeeping, so each rule here guards what the menu — and
-// any screenshot of it — shows: an organization only for a seat in one, never
-// the "<email>'s Organization" Claude gives a personal account.
+// same shape: person, whose account it is, plan in brackets. The names come
+// from Claude Code's own bookkeeping, so each rule here guards what the menu —
+// and any screenshot of it — shows: an organization only for a seat in one,
+// and "Personal" rather than the "<email>'s Organization" Claude gives a
+// personal account.
 func TestAccountName(t *testing.T) {
 	const personalOrg = "ada@example.com's Organization"
 	for _, tc := range []struct {
@@ -197,10 +198,10 @@ func TestAccountName(t *testing.T) {
 	}{
 		{"team seat", account{DisplayName: "Ada", OrganizationName: "Acme", OrganizationType: "claude_team"}, "Ada · Acme (Team)"},
 		{"enterprise seat", account{DisplayName: "Ada", OrganizationName: "Acme", OrganizationType: "claude_enterprise"}, "Ada · Acme (Enterprise)"},
-		{"personal plan", account{DisplayName: "Ada", OrganizationName: personalOrg, OrganizationType: "claude_max", PlanDisplayName: "Max 20x"}, "Ada (Max 20x)"},
-		{"personal plan without a plan name", account{DisplayName: "Ada", OrganizationName: personalOrg, OrganizationType: "claude_max_5x"}, "Ada (Max 5x)"},
+		{"personal plan", account{DisplayName: "Ada", OrganizationName: personalOrg, OrganizationType: "claude_max", PlanDisplayName: "Max 20x"}, "Ada · Personal (Max 20x)"},
+		{"personal plan without a plan name", account{DisplayName: "Ada", OrganizationName: personalOrg, OrganizationType: "claude_max_5x"}, "Ada · Personal (Max 5x)"},
 		{"no display name", account{OrganizationName: "Acme", OrganizationType: "claude_team"}, "Acme (Team)"},
-		{"plan alone", account{OrganizationName: personalOrg, OrganizationType: "claude_pro"}, "Pro"},
+		{"no display name on a personal plan", account{OrganizationName: personalOrg, OrganizationType: "claude_pro"}, "Personal (Pro)"},
 		{"unknown type", account{DisplayName: "Ada", OrganizationName: personalOrg, OrganizationType: "other"}, "Ada"},
 		{"nothing recorded", account{}, ""},
 	} {
@@ -219,7 +220,7 @@ func TestProfileLabels(t *testing.T) {
 	accounts := []account{max, {DisplayName: "Ada", OrganizationName: "Acme", OrganizationType: "claude_team"}, max, {}}
 
 	got := profileLabels(profiles, accounts)
-	want := []string{"Ada (Max) [default]", "Ada · Acme (Team)", "Ada (Max) [claude-side]", "claude-new"}
+	want := []string{"Ada · Personal (Max) [default]", "Ada · Acme (Team)", "Ada · Personal (Max) [claude-side]", "claude-new"}
 	if !slices.Equal(got, want) {
 		t.Errorf("profileLabels = %q, want %q", got, want)
 	}

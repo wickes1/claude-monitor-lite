@@ -46,9 +46,9 @@ func TestHeadTitle(t *testing.T) {
 		wantTitle     string
 		wantShow      bool
 	}{
-		{"Ada (Max)", "", false, "", false},
-		{"Ada (Max)", "Loading…", false, "Loading…", true},
-		{"Ada (Max)", "", true, "Ada (Max)", true},
+		{"Ada · Personal (Max)", "", false, "", false},
+		{"Ada · Personal (Max)", "Loading…", false, "Loading…", true},
+		{"Ada · Personal (Max)", "", true, "Ada · Personal (Max)", true},
 		{"Ada · Acme (Team)", "Waiting for Claude Code (as of 09:03)", true, "Ada · Acme (Team) — Waiting for Claude Code (as of 09:03)", true},
 	} {
 		title, show := headTitle(tc.label, tc.status, tc.grouped)

@@ -97,7 +97,7 @@ claude-monitor-lite add ~/.claude-work
 The menu then has one group per environment, each with the same rows as before:
 
 ```
-Ada (Max)
+Ada · Personal (Max)
 ✓ 5-Hour Session: 12% (resets 2026-11-17 14:10, in 4h 30m)
   Weekly (All): 3% (resets 2026-11-19 20:00, in 58h 20m)
 ─────────────
@@ -106,7 +106,7 @@ Ada · Acme (Team)
   Weekly (All): 21% (resets 2026-11-21 09:00, in 95h 20m)
 ```
 
-- **Names** come from the account logged in there, as Claude Code records it: your name, the organization for a Team or Enterprise seat, and the plan in brackets. An environment whose account cannot be read is named after its folder.
+- **Names** come from the account logged in there, as Claude Code records it: your name, the organization for a Team or Enterprise seat or "Personal" for your own plan, and the plan in brackets. An environment whose account cannot be read is named after its folder.
 - **The menu bar** still shows one row, without a name: click a row in any group to pin it. Until you do, it shows the first environment's pick.
 - **Each group stands alone.** One account failing to load says so in its own group and leaves the menu bar to the selected one.
 - **Files:** the list is kept in `~/.claude-monitor-lite.json` (`profiles`, in menu order; an empty string is the default environment). The monitor has one PID file, log and LaunchAgent however many environments it watches; the usage cache and status line feed of an added environment are `~/.claude-monitor-lite.<folder>-<hash>.*`, with the same directory hash Claude Code uses.

@@ -160,14 +160,31 @@ func (a account) plan() string {
 	return strings.ToUpper(plan[:1]) + plan[1:]
 }
 
-// name is how the account names itself: the person, the organization, and
-// the plan in brackets — "Ada · Acme (Team)", "Ada (Max)". Only a Team or
-// Enterprise seat has an organization to show: Claude names a personal
-// account's "<email>'s Organization", which would put the address in the
-// menu and in every screenshot of it. Empty when the account says nothing.
+// personalOrganization stands where a Team or Enterprise seat shows its
+// organization, so every group is named in the same shape.
+const personalOrganization = "Personal"
+
+// organization is whose account this is: the organization for a Team or
+// Enterprise seat, personalOrganization for any other Claude plan. A personal
+// account's own organization name is not used: Claude sets it to
+// "<email>'s Organization", which says nothing new and would put the address
+// in the menu and in every screenshot of it.
+func (a account) organization() string {
+	switch {
+	case a.OrganizationType == "claude_team" || a.OrganizationType == "claude_enterprise":
+		return a.OrganizationName
+	case strings.HasPrefix(a.OrganizationType, "claude_"):
+		return personalOrganization
+	}
+	return ""
+}
+
+// name is how the account names itself: the person, whose account it is, and
+// the plan in brackets — "Ada · Acme (Team)", "Ada · Personal (Max)". Empty
+// when the account says nothing.
 func (a account) name() string {
 	who := a.DisplayName
-	if org := a.OrganizationName; org != "" && (a.OrganizationType == "claude_team" || a.OrganizationType == "claude_enterprise") {
+	if org := a.organization(); org != "" {
 		if who != "" {
 			who += " · "
 		}
